@@ -14,8 +14,7 @@
 //    - CatalogService: UPC lookup backed by SwiftData
 //    - SyncService: SharePoint/CSV pull, parse, atomic catalog replace
 //    - AudioService: error buzzer via AudioServices
-//    - ScanView: keyboard-wedge scanner input, buzzer on over-limit,
-//      manual override sheet on UPC miss
+//    - ScanView: keyboard-wedge scanner input, manual override sheet on UPC miss
 //
 //  Not yet wired here (add as follow-ups):
 //    - HistoryView, SessionDetailView, SettingsView, ManualPriceSheet
@@ -33,7 +32,6 @@ import AVFoundation
 import BackgroundTasks
 import VisionKit
 import Vision
-import MessageUI
 
 // MARK: - App entry
 
@@ -50,9 +48,7 @@ struct BackstockTrackerApp: App {
                 AreaManager.self,
                 AreaManagerSync.self,
                 Store.self,
-                StoreSync.self,
-                TerritoryManager.self,
-                TerritoryManagerSync.self
+                StoreSync.self
             ])
             let config = ModelConfiguration(schema: schema)
             return try ModelContainer(for: schema, configurations: [config])
@@ -85,8 +81,7 @@ struct BackstockTrackerApp: App {
         async let roster: Void = RosterSyncCoordinator.shared.run(container: container)
         async let catalog: Void = CatalogSyncCoordinator.shared.run(container: container)
         async let stores: Void = StoreSyncCoordinator.shared.run(container: container)
-        async let tms: Void = TerritoryManagerSyncCoordinator.shared.run(container: container)
-        _ = await (roster, catalog, stores, tms)
+        _ = await (roster, catalog, stores)
     }
 }
 
@@ -206,44 +201,6 @@ final class StoreSyncCoordinator {
     }
 }
 
-// Background territory-managers sync. Runs at app launch. Populates the
-// TerritoryManager table, which the submit flow uses to look up the TM's
-// email when an over-limit credit needs written approval.
-@Observable
-@MainActor
-final class TerritoryManagerSyncCoordinator {
-    static let shared = TerritoryManagerSyncCoordinator()
-
-    enum State {
-        case idle
-        case syncing
-        case succeeded(count: Int)
-        case failed(message: String)
-    }
-
-    var state: State = .idle
-
-    // Google Drive share URL for territory_managers.csv.
-    // Either share link format works — the SyncService normalizes it.
-    private let sourceURL = URL(string: "https://drive.google.com/file/d/1eJ7rQLkO9uCwATuPfPCxvSX-jIRnggss")!
-
-    private init() {}
-
-    @MainActor
-    func run(container: ModelContainer) async {
-        state = .syncing
-        let service = SyncService(sourceURL: sourceURL)
-        let record = await service.syncTerritoryManagers(into: container)
-        let context = ModelContext(container)
-        context.insert(record)
-        try? context.save()
-        switch record.status {
-        case .success: state = .succeeded(count: record.managerCount)
-        case .failed, .partial: state = .failed(message: record.errorMessage ?? "Unknown error")
-        }
-    }
-}
-
 // MARK: - Models (SwiftData)
 
 @Model
@@ -325,57 +282,10 @@ final class AreaManager {
     }
 }
 
-// Maps each territory to the email address of its Territory Manager.
-// Used when an AM submits an over-limit credit request that requires
-// written approval — we compose an email To: the TM for that territory,
-// CC: the submitting AM.
-@Model
-final class TerritoryManager {
-    @Attribute(.unique) var territory: String
-    var email: String
-    var lastUpdated: Date
-
-    init(territory: String, email: String, lastUpdated: Date = .now) {
-        self.territory = territory
-        self.email = email
-        self.lastUpdated = lastUpdated
-    }
-}
-
-@Model
-final class TerritoryManagerSync {
-    @Attribute(.unique) var id: UUID
-    var syncedAt: Date
-    var managerCount: Int
-    var sourceUrl: String
-    var statusRaw: String
-    var errorMessage: String?
-
-    var status: SyncStatus {
-        get { SyncStatus(rawValue: statusRaw) ?? .failed }
-        set { statusRaw = newValue.rawValue }
-    }
-
-    init(id: UUID = UUID(),
-         syncedAt: Date = .now,
-         managerCount: Int,
-         sourceUrl: String,
-         status: SyncStatus,
-         errorMessage: String? = nil) {
-        self.id = id
-        self.syncedAt = syncedAt
-        self.managerCount = managerCount
-        self.sourceUrl = sourceUrl
-        self.statusRaw = status.rawValue
-        self.errorMessage = errorMessage
-    }
-}
-
 enum SessionStatus: String, Codable, CaseIterable {
     case active
     case submitted
     case abandoned
-    case overLimit
 }
 
 @Model
@@ -594,9 +504,6 @@ final class ScanSessionStore {
         }
     }
 
-    static let hardLimit: Decimal = 149.99
-    static let warnThreshold: Decimal = 134.99   // 90% of 149.99
-
     var items: [InMemoryItem] = []
     var currentEmployeeNumber: String = "UNASSIGNED"
     var currentStoreNumber: String?
@@ -605,42 +512,18 @@ final class ScanSessionStore {
         items.reduce(0) { $0 + $1.lineTotal }
     }
 
-    var isOverLimit: Bool {
-        subtotal > Self.hardLimit
-    }
-
-    var isApproachingLimit: Bool {
-        subtotal >= Self.warnThreshold && subtotal <= Self.hardLimit
-    }
-
-    var percentOfLimit: Double {
-        let pct = (subtotal as NSDecimalNumber).doubleValue / (Self.hardLimit as NSDecimalNumber).doubleValue
-        return min(1.0, max(0.0, pct))
-    }
-
     func add(_ item: InMemoryItem) {
         items.append(item)
-        if isOverLimit {
-            AudioService.shared.playOverLimitBuzzer()
-        } else {
-            AudioService.shared.playScanConfirm()
-        }
+        AudioService.shared.playScanConfirm()
     }
 
     func remove(_ item: InMemoryItem) {
         items.removeAll { $0.id == item.id }
     }
 
-    // Adjusts quantity on an existing line. Minimum 1 — use remove() to
-    // take the item off entirely. Re-plays the buzzer if the change
-    // pushes the session over the limit.
     func setQuantity(id: UUID, quantity: Int) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
-        let wasOverLimit = isOverLimit
         items[idx].quantity = max(1, quantity)
-        if !wasOverLimit && isOverLimit {
-            AudioService.shared.playOverLimitBuzzer()
-        }
     }
 
     func clear() {
@@ -654,7 +537,7 @@ final class ScanSessionStore {
 
         let session = ScanSession(
             employeeNumber: currentEmployeeNumber,
-            status: isOverLimit ? .overLimit : .submitted,
+            status: .submitted,
             storeNumber: currentStoreNumber,
             catalogSyncedAt: catalogSyncedAt
         )
@@ -839,7 +722,6 @@ actor SyncService {
         case emptyCatalog
         case emptyRoster
         case emptyStores
-        case emptyTerritoryManagers
     }
 
     struct ParsedProduct {
@@ -1168,79 +1050,12 @@ actor SyncService {
         return parsed.count
     }
 
-    // MARK: Territory managers sync
-    //
-    // CSV format expected (first row is header):
-    //   territory,email
-    //   East,east.tm@jacent.com
-    //   West,west.tm@jacent.com
-
-    struct ParsedTerritoryManager {
-        let territory: String
-        let email: String
-    }
-
-    func syncTerritoryManagers(into container: ModelContainer) async -> TerritoryManagerSync {
-        let startURL = sourceURL.absoluteString
-        do {
-            let csv = try await fetchCSV()
-            let parsed = try parseTerritoryManagers(csv: csv)
-            guard !parsed.isEmpty else { throw SyncError.emptyTerritoryManagers }
-            let count = try await applyAtomicReplaceTerritoryManagers(parsed: parsed, container: container)
-            return TerritoryManagerSync(managerCount: count, sourceUrl: startURL, status: .success)
-        } catch {
-            return TerritoryManagerSync(
-                managerCount: 0,
-                sourceUrl: startURL,
-                status: .failed,
-                errorMessage: String(describing: error)
-            )
-        }
-    }
-
-    private func parseTerritoryManagers(csv: String) throws -> [ParsedTerritoryManager] {
-        var result: [ParsedTerritoryManager] = []
-        let lines = csv.split(whereSeparator: \.isNewline)
-        guard lines.count > 1 else { throw SyncError.emptyTerritoryManagers }
-
-        for (idx, rawLine) in lines.enumerated() where idx > 0 {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.isEmpty { continue }
-            let cols = line.split(separator: ",", omittingEmptySubsequences: false).map { String($0) }
-            guard cols.count >= 2 else {
-                throw SyncError.malformedCSV(
-                    line: idx + 1,
-                    reason: "expected 2 columns: territory, email"
-                )
-            }
-            let territory = cols[0].trimmingCharacters(in: .whitespaces)
-            let email = cols[1].trimmingCharacters(in: .whitespaces)
-
-            guard !territory.isEmpty, !email.isEmpty else {
-                throw SyncError.malformedCSV(line: idx + 1, reason: "territory or email is empty")
-            }
-            result.append(ParsedTerritoryManager(territory: territory, email: email))
-        }
-        return result
-    }
-
-    @MainActor
-    private func applyAtomicReplaceTerritoryManagers(parsed: [ParsedTerritoryManager], container: ModelContainer) async throws -> Int {
-        let context = ModelContext(container)
-        try context.delete(model: TerritoryManager.self)
-        for tm in parsed {
-            context.insert(TerritoryManager(territory: tm.territory, email: tm.email))
-        }
-        try context.save()
-        return parsed.count
-    }
 }
 
 // MARK: - Audio service (buzzer)
 
 // Two distinct sounds: a short confirm chirp on a successful scan,
-// and an attention-grabbing buzzer when the running total crosses the
-// $149.99 hard limit or a UPC is not found.
+// and an attention-grabbing buzzer when a UPC is not found.
 //
 // Uses AVAudioPlayer with synthesized PCM tones rather than iOS system
 // sounds. System sounds have proven unreliable across iOS versions —
@@ -1271,13 +1086,6 @@ final class AudioService {
     func playScanConfirm() {
         confirmPlayer?.currentTime = 0
         confirmPlayer?.play()
-    }
-
-    func playOverLimitBuzzer() {
-        buzzerPlayer?.currentTime = 0
-        buzzerPlayer?.play()
-        // Pair with haptic so the AM feels it even in a loud store.
-        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
     }
 
     func playNotFound() {
@@ -1634,7 +1442,6 @@ struct ScanView: View {
     // and stores partition by area).
     @AppStorage("currentEmployeeNumber") private var currentEmployeeNumber: String = ""
     @Query private var allManagers: [AreaManager]
-    @Query private var territoryManagers: [TerritoryManager]
 
     // Resolve the signed-in AM's area, or "" if not yet signed in or
     // not found in the roster. Empty string = no area filter, all
@@ -1648,92 +1455,6 @@ struct ScanView: View {
     private var currentAM: AreaManager? {
         guard !currentEmployeeNumber.isEmpty else { return nil }
         return allManagers.first { $0.employeeNumber == currentEmployeeNumber }
-    }
-
-    // AM's email for the CC line, or nil if not on file. When nil the
-    // approval email is sent without a CC.
-    private var currentAMEmail: String? {
-        guard let am = currentAM, !am.email.isEmpty else { return nil }
-        return am.email
-    }
-
-    // Territory manager email for the signed-in AM's territory, or nil
-    // if not on file. When nil the submit sheet shows an error message
-    // instead of the "open email draft" button.
-    private var territoryManagerEmail: String? {
-        guard let am = currentAM, !am.territory.isEmpty else { return nil }
-        let match = territoryManagers.first { $0.territory == am.territory }
-        guard let email = match?.email, !email.isEmpty else { return nil }
-        return email
-    }
-
-    private func buildEmailSubject() -> String {
-        let total = formatCurrencyForEmail(store.subtotal)
-        return "Credit approval request: \(selectedStore) #\(selectedStoreNumber) — \(total)"
-    }
-
-    private func buildEmailBody() -> String {
-        var lines: [String] = []
-        lines.append("Hi,")
-        lines.append("")
-        lines.append("I'm requesting written approval for a credit that exceeds the $149.99 limit.")
-        lines.append("")
-        lines.append("SESSION DETAILS")
-        lines.append("---------------")
-        if let am = currentAM {
-            lines.append("Area Manager: \(am.fullName) (#\(am.employeeNumber))")
-            lines.append("Territory: \(am.territory)")
-            lines.append("Area: \(am.area)")
-        } else {
-            lines.append("Area Manager: [unassigned]")
-        }
-        lines.append("Store: \(selectedStore)")
-        lines.append("Store number: \(selectedStoreNumber)")
-        lines.append("Date: \(formattedNow())")
-        lines.append("")
-        lines.append("LINE ITEMS")
-        lines.append("----------")
-        var running: Decimal = 0
-        for (idx, item) in store.items.enumerated() {
-            running += item.lineTotal
-            let qty = item.quantity > 1 ? "\(item.quantity) × " : ""
-            let line = "\(idx + 1). \(qty)\(item.name) @ \(formatCurrencyForEmail(item.price)) = \(formatCurrencyForEmail(item.lineTotal))   (running: \(formatCurrencyForEmail(running)))"
-            lines.append(line)
-            lines.append("   UPC: \(item.upc)")
-            if item.manualOverride {
-                lines.append("   [manual override]\(item.overrideNote.map { " — \($0)" } ?? "")")
-            }
-        }
-        lines.append("")
-        lines.append("TOTAL")
-        lines.append("-----")
-        let totalUnits = store.items.reduce(0) { $0 + $1.quantity }
-        lines.append("Items: \(store.items.count) line\(store.items.count == 1 ? "" : "s") (\(totalUnits) unit\(totalUnits == 1 ? "" : "s"))")
-        lines.append("Total: \(formatCurrencyForEmail(store.subtotal))")
-        lines.append("Limit: \(formatCurrencyForEmail(ScanSessionStore.hardLimit))")
-        lines.append("Over limit by: \(formatCurrencyForEmail(store.subtotal - ScanSessionStore.hardLimit))")
-        lines.append("")
-        lines.append("Please reply with written approval so I can proceed.")
-        lines.append("")
-        lines.append("Thanks,")
-        if let am = currentAM {
-            lines.append(am.fullName)
-        }
-        return lines.joined(separator: "\n")
-    }
-
-    private func formatCurrencyForEmail(_ value: Decimal) -> String {
-        let f = NumberFormatter()
-        f.numberStyle = .currency
-        f.locale = Locale(identifier: "en_US")
-        return f.string(from: value as NSDecimalNumber) ?? "$\(value)"
-    }
-
-    private func formattedNow() -> String {
-        let f = DateFormatter()
-        f.dateStyle = .medium
-        f.timeStyle = .short
-        return f.string(from: .now)
     }
 
     // Drive the empty-catalog and empty-stores banners. When either is
@@ -1797,15 +1518,10 @@ struct ScanView: View {
             }
             .sheet(isPresented: $showSubmitConfirm) {
                 SubmitSheet(
-                    isOverLimit: store.isOverLimit,
                     subtotal: store.subtotal,
                     store: selectedStore,
                     storeNumber: selectedStoreNumber,
-                    itemCount: store.items.count,
-                    tmEmail: territoryManagerEmail,
-                    amEmail: currentAMEmail,
-                    emailSubject: buildEmailSubject(),
-                    emailBody: buildEmailBody()
+                    itemCount: store.items.count
                 ) {
                     submit()
                 }
@@ -2030,21 +1746,15 @@ struct ScanView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text("Limit \(Self.currency(ScanSessionStore.hardLimit))")
+                Text("\(store.items.count) line\(store.items.count == 1 ? "" : "s")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Text(Self.currency(store.subtotal))
                 .font(.system(size: 34, weight: .medium))
-                .foregroundStyle(store.isOverLimit ? .red : .primary)
-            ProgressView(value: store.percentOfLimit)
-                .tint(progressTint)
-            Text(statusMessage)
-                .font(.caption)
-                .foregroundStyle(statusTint)
         }
         .padding()
-        .background(statusBackground)
+        .background(Color(.secondarySystemBackground))
     }
 
     private var scanField: some View {
@@ -2156,11 +1866,10 @@ struct ScanView: View {
                 Button("Clear") { store.clear() }
                     .buttonStyle(.bordered)
                 Spacer()
-                Button(store.isOverLimit ? "Request approval" : "Submit credit") {
+                Button("Submit") {
                     showSubmitConfirm = true
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(store.isOverLimit ? .orange : .accentColor)
                 .disabled(store.items.isEmpty)
             }
         }
@@ -2307,10 +2016,6 @@ struct ScanView: View {
     private func submit() {
         let catalog = CatalogService(context: context)
         let lastSync = catalog.lastSyncedAt()
-        // Both under-limit and over-limit submits reach here. Under-limit
-        // goes straight to audit. Over-limit arrives here only after the
-        // AM has successfully composed the approval email (the SubmitSheet
-        // gates it). The session's status will reflect which path it was.
         do {
             try store.submit(into: context, catalogSyncedAt: lastSync)
             showSubmitConfirm = false
@@ -2320,30 +2025,6 @@ struct ScanView: View {
     }
 
     // MARK: presentation helpers
-
-    private var progressTint: Color {
-        if store.isOverLimit { return .red }
-        if store.isApproachingLimit { return .orange }
-        return .green
-    }
-
-    private var statusTint: Color {
-        if store.isOverLimit { return .red }
-        if store.isApproachingLimit { return .orange }
-        return .green
-    }
-
-    private var statusMessage: String {
-        if store.isOverLimit { return "Over limit — written approval required" }
-        if store.isApproachingLimit { return "Approaching limit" }
-        return "Within limit"
-    }
-
-    private var statusBackground: Color {
-        if store.isOverLimit { return .red.opacity(0.08) }
-        if store.isApproachingLimit { return .orange.opacity(0.08) }
-        return Color(.secondarySystemBackground)
-    }
 
     static func currency(_ d: Decimal) -> String {
         let formatter = NumberFormatter()
@@ -2429,150 +2110,44 @@ struct ManualPriceSheet: View {
 // MARK: - Submit confirm sheet
 
 struct SubmitSheet: View {
-    let isOverLimit: Bool
     let subtotal: Decimal
     let store: String
     let storeNumber: String
     let itemCount: Int
-    let tmEmail: String?
-    let amEmail: String?
-    let emailSubject: String
-    let emailBody: String
     let onConfirm: () -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @State private var showMailComposer = false
-    @State private var mailResult: MFMailComposeResult?
-    @State private var showNoMailAlert = false
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 16) {
-                if isOverLimit {
-                    overLimitBody
-                } else {
-                    normalBody
+                Text("Submit backstock?")
+                    .font(.title3).fontWeight(.medium)
+                VStack(spacing: 4) {
+                    Text(formatCurrency(subtotal))
+                        .font(.system(size: 34, weight: .medium))
+                    Text("\(itemCount) item\(itemCount == 1 ? "" : "s") at \(store) #\(storeNumber)")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
+                Text("This will record the session to the audit log and clear the scan list.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Button("Confirm and submit") {
+                    onConfirm()
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                Spacer()
             }
             .padding()
-            .navigationTitle(isOverLimit ? "Approval required" : "Submit")
+            .navigationTitle("Submit")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
             }
-            .sheet(isPresented: $showMailComposer) {
-                if let tm = tmEmail {
-                    MailComposerView(
-                        to: [tm],
-                        cc: amEmail.map { [$0] } ?? [],
-                        subject: emailSubject,
-                        body: emailBody,
-                        result: $mailResult
-                    )
-                }
-            }
-            .onChange(of: mailResult) { _, newValue in
-                guard let r = newValue else { return }
-                switch r {
-                case .sent, .saved:
-                    // Persist the session locally so we have a record
-                    // even though the final approval happens via email.
-                    onConfirm()
-                    dismiss()
-                case .cancelled, .failed:
-                    // AM cancelled or mail failed — don't persist,
-                    // let them try again.
-                    break
-                @unknown default:
-                    break
-                }
-                // Reset so a subsequent send can re-trigger onChange.
-                mailResult = nil
-            }
-            .alert("No mail account configured", isPresented: $showNoMailAlert) {
-                Button("OK") {}
-            } message: {
-                Text("Your device needs a configured mail account (Mail app) to send the approval email. Set one up in Settings → Mail.")
-            }
-        }
-    }
-
-    private var normalBody: some View {
-        VStack(spacing: 16) {
-            Text("Submit credit request?")
-                .font(.title3).fontWeight(.medium)
-            VStack(spacing: 4) {
-                Text(formatCurrency(subtotal))
-                    .font(.system(size: 34, weight: .medium))
-                Text("\(itemCount) item\(itemCount == 1 ? "" : "s") at \(store) #\(storeNumber)")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Text("This will record the session to the audit log and clear the scan list.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Button("Confirm and submit") {
-                onConfirm()
-                dismiss()
-            }
-            .buttonStyle(.borderedProminent)
-            Spacer()
-        }
-    }
-
-    private var overLimitBody: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "envelope.badge")
-                .font(.system(size: 42))
-                .foregroundStyle(.orange)
-            VStack(spacing: 4) {
-                Text(formatCurrency(subtotal))
-                    .font(.system(size: 34, weight: .medium))
-                    .foregroundStyle(.red)
-                Text("\(itemCount) item\(itemCount == 1 ? "" : "s") at \(store) #\(storeNumber)")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Text("This credit is over the $149.99 limit and requires written approval from the Territory Manager.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal)
-            if let tm = tmEmail {
-                VStack(spacing: 2) {
-                    Text("The email will be sent to:")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Text(tm)
-                        .font(.caption).fontWeight(.medium)
-                    if let am = amEmail {
-                        Text("CC: \(am)")
-                            .font(.caption2).foregroundStyle(.secondary)
-                    }
-                }
-                .padding(.vertical, 8)
-                .padding(.horizontal, 14)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                Button {
-                    if MFMailComposeViewController.canSendMail() {
-                        showMailComposer = true
-                    } else {
-                        showNoMailAlert = true
-                    }
-                } label: {
-                    Label("Open email draft", systemImage: "envelope")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-            } else {
-                Text("No Territory Manager email on file for this territory. Contact your Area Manager or check that territory_managers.csv is synced.")
-                    .font(.caption).foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
-            }
-            Spacer()
         }
     }
 
@@ -2581,55 +2156,6 @@ struct SubmitSheet: View {
         f.numberStyle = .currency
         f.locale = Locale(identifier: "en_US")
         return f.string(from: value as NSDecimalNumber) ?? "$\(value)"
-    }
-}
-
-// UIKit wrapper around MFMailComposeViewController so SwiftUI can present it.
-struct MailComposerView: UIViewControllerRepresentable {
-    let to: [String]
-    let cc: [String]
-    let subject: String
-    let body: String
-    @Binding var result: MFMailComposeResult?
-
-    @Environment(\.dismiss) private var dismiss
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(result: $result, dismiss: { dismiss() })
-    }
-
-    func makeUIViewController(context: Context) -> MFMailComposeViewController {
-        let vc = MFMailComposeViewController()
-        vc.mailComposeDelegate = context.coordinator
-        vc.setToRecipients(to)
-        if !cc.isEmpty { vc.setCcRecipients(cc) }
-        vc.setSubject(subject)
-        vc.setMessageBody(body, isHTML: false)
-        return vc
-    }
-
-    func updateUIViewController(_ uiViewController: MFMailComposeViewController, context: Context) {}
-
-    class Coordinator: NSObject, MFMailComposeViewControllerDelegate {
-        @Binding var result: MFMailComposeResult?
-        let dismiss: () -> Void
-
-        init(result: Binding<MFMailComposeResult?>, dismiss: @escaping () -> Void) {
-            self._result = result
-            self.dismiss = dismiss
-        }
-
-        func mailComposeController(_ controller: MFMailComposeViewController,
-                                   didFinishWith result: MFMailComposeResult,
-                                   error: Error?) {
-            if let error = error {
-                print("Mail compose error: \(error)")
-                self.result = .failed
-            } else {
-                self.result = result
-            }
-            dismiss()
-        }
     }
 }
 
@@ -2664,7 +2190,6 @@ struct HistoryRow: View {
                 Spacer()
                 Text(ScanView.currency(session.totalAmount))
                     .fontWeight(.medium)
-                    .foregroundStyle(session.status == .overLimit ? .red : .primary)
             }
             HStack {
                 Text(itemsSummary)
@@ -2703,14 +2228,12 @@ struct StatusPill: View {
         case .active: "Active"
         case .submitted: "Submitted"
         case .abandoned: "Abandoned"
-        case .overLimit: "Over limit"
         }
     }
 
     private var background: Color {
         switch status {
         case .submitted: .green.opacity(0.15)
-        case .overLimit: .red.opacity(0.15)
         case .abandoned: .gray.opacity(0.15)
         case .active: .blue.opacity(0.15)
         }
@@ -2719,7 +2242,6 @@ struct StatusPill: View {
     private var foreground: Color {
         switch status {
         case .submitted: .green
-        case .overLimit: .red
         case .abandoned: .gray
         case .active: .blue
         }
@@ -2741,9 +2263,6 @@ struct SessionDetailView: View {
             ScrollView {
                 VStack(spacing: 0) {
                     headerSection(session: session)
-                    if session.status == .overLimit {
-                        overLimitBanner
-                    }
                     lineItemsSection(session: session)
                     totalsSection(session: session)
                     metadataSection(session: session)
@@ -2774,7 +2293,6 @@ struct SessionDetailView: View {
             VStack(spacing: 4) {
                 Text(formatCurrency(session.totalAmount))
                     .font(.system(size: 38, weight: .medium))
-                    .foregroundStyle(session.status == .overLimit ? .red : .primary)
                 Text(session.submittedAt ?? session.startedAt, format: .dateTime.month(.wide).day().year().hour().minute())
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -2801,24 +2319,6 @@ struct SessionDetailView: View {
         .padding(.horizontal, 20)
         .padding(.bottom, 20)
         .background(Color(.systemBackground))
-    }
-
-    private var overLimitBanner: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-                .font(.system(size: 16))
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Required written approval")
-                    .font(.subheadline).fontWeight(.medium)
-                Text("This session exceeded the $149.99 credit limit. Approval email sent to Territory Manager at submission time.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.12))
     }
 
     private func lineItemsSection(session: ScanSession) -> some View {
@@ -3017,10 +2517,6 @@ struct SettingsView: View {
                     if !lastStoreSyncMessage.isEmpty {
                         Text(lastStoreSyncMessage).font(.caption).foregroundStyle(.secondary)
                     }
-                }
-                Section("Session") {
-                    LabeledContent("Warn at", value: "90% ($134.99)")
-                    LabeledContent("Hard limit", value: "$149.99")
                 }
                 Section("Source") {
                     LabeledContent("Type", value: "Google Drive")
