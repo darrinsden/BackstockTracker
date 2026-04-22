@@ -20,8 +20,8 @@ Single-file Swift project (`BackstockTrackerApp.swift`, ~3000 lines, brace-balan
 | File | Schema | Drive ID |
 |------|--------|----------|
 | `area_managers.csv` | `employeeNumber, firstName, lastName, territory, area, email` (6th optional) | `1rOFqR8IDo4lEJmT39tHtw7JsLggOauxf` |
-| `catalog.csv` | `upc, name, price, category, store` (12-digit UPC-A; preserve leading zeros) | `1izR-bDANhkOBlOyvgB9k4gCHOUSn6x5n` |
-| `stores.csv` | `store, storeNumber, area` (3rd optional for backward compat) | `1WtggB4_n1G2avUV4q0Di4VRjG2ZdrEh3` |
+| `catalog.csv` | `upc, name, price, commodity, store, retailPrice, rank` (12-digit UPC-A; preserve leading zeros; cols 4–7 optional) | `1izR-bDANhkOBlOyvgB9k4gCHOUSn6x5n` |
+| `stores.csv` | `store, storeNumber, area, shortName` (3rd and 4th optional for backward compat) | `1WtggB4_n1G2avUV4q0Di4VRjG2ZdrEh3` |
 | `territory_managers.csv` | `territory, email` | `1eJ7rQLkO9uCwATuPfPCxvSX-jIRnggss` |
 
 `SyncService.normalizeSourceURL` accepts any Drive URL format (share link or direct download) and rewrites to the `uc?export=download&id=...` form.

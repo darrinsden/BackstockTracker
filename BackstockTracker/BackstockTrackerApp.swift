@@ -1,9 +1,9 @@
 //
 //  BackstockTrackerApp.swift
-//  AM Credit Tracker
+//  Backstock Tracker
 //
-//  A single-file skeleton for AM Credit Tracker, the Jacent Strategic Merchandising
-//  area manager credit limit tracking app. Drop this file into a new
+//  A single-file skeleton for Backstock Tracker, the Jacent Strategic Merchandising
+//  Backstock tracking app. Drop this file into a new
 //  iOS App project in Xcode (iOS 17+, Swift 5.9+, SwiftData).
 //
 //  Scope covered:
@@ -32,6 +32,7 @@ import AVFoundation
 import BackgroundTasks
 import VisionKit
 import Vision
+import MessageUI
 
 // MARK: - App entry
 
@@ -212,25 +213,42 @@ final class Product {
     // a DB constraint.
     var upc: String
     var name: String
+    // Wholesale / credit price — the value that accumulates against
+    // the session's $149.99 limit.
     var price: Decimal
-    var category: String?
+    // Merchandising bucket from catalog.csv (column "commodity" —
+    // previously "category"). Kept optional so old rows or rows
+    // missing the column parse cleanly.
+    var commodity: String?
     // Store name (the retailer chain: "Target", "Walmart"). The specific
     // store number is NOT on the product — it's on the Store entity below,
     // which maps chains to their specific numbered locations.
     var store: String
+    // Retail price (what the item sells for on the shelf). Optional so
+    // rows that don't yet carry it parse cleanly. Shown separately from
+    // `price` in UI where both are useful (e.g. margin-at-a-glance).
+    var retailPrice: Decimal?
+    // Merchandising rank — lower-is-better ordering hint from the
+    // catalog source, used for default sort in future surfaces.
+    // Optional because older/partial catalogs omit it.
+    var rank: Int?
     var lastUpdated: Date
 
     init(upc: String,
          name: String,
          price: Decimal,
-         category: String? = nil,
+         commodity: String? = nil,
          store: String = "",
+         retailPrice: Decimal? = nil,
+         rank: Int? = nil,
          lastUpdated: Date = .now) {
         self.upc = upc
         self.name = name
         self.price = price
-        self.category = category
+        self.commodity = commodity
         self.store = store
+        self.retailPrice = retailPrice
+        self.rank = rank
         self.lastUpdated = lastUpdated
     }
 }
@@ -246,13 +264,30 @@ final class Store {
     var store: String
     var storeNumber: String
     var area: String
+    // Optional compact label for cramped UI surfaces (e.g. history rows,
+    // picker summaries). Empty string = no shortname set; callers should
+    // fall back to `store`. Kept in addition to `store` rather than
+    // replacing it so the canonical name stays available for emails,
+    // print headers, and CSV round-trips.
+    var shortName: String
     var lastUpdated: Date
 
-    init(store: String, storeNumber: String, area: String = "", lastUpdated: Date = .now) {
+    init(store: String,
+         storeNumber: String,
+         area: String = "",
+         shortName: String = "",
+         lastUpdated: Date = .now) {
         self.store = store
         self.storeNumber = storeNumber
         self.area = area
+        self.shortName = shortName
         self.lastUpdated = lastUpdated
+    }
+
+    /// What to show in space-constrained UI. Uses shortName when
+    /// provided, otherwise falls back to the full store name.
+    var displayName: String {
+        shortName.isEmpty ? store : shortName
     }
 }
 
@@ -710,8 +745,14 @@ struct StoreService {
 // Microsoft Graph call using MSAL — see comments at the call site.
 //
 // CSV format expected (first row is header):
-//   upc,name,price,category
-//   037000127116,Tide Pods 42ct,19.99,Laundry
+//   upc,name,price,commodity,store,retailPrice,rank
+//   037000127116,Tide Pods 42ct,19.99,Laundry,Target,24.99,1
+//
+// Columns 4 (commodity) onward are optional for backward
+// compatibility. `price` is the wholesale/credit price that counts
+// against the session limit; `retailPrice` is the shelf price and is
+// displayed separately. `rank` is a numeric merchandising priority
+// (lower is more prominent) — parsed when present, ignored otherwise.
 //
 // Prices parse as Decimal via NSDecimalNumber(string:) to avoid
 // floating-point drift.
@@ -728,8 +769,10 @@ actor SyncService {
         let upc: String
         let name: String
         let price: Decimal
-        let category: String?
+        let commodity: String?
         let store: String
+        let retailPrice: Decimal?
+        let rank: Int?
     }
 
     let sourceURL: URL
@@ -837,13 +880,32 @@ actor SyncService {
             let upc = cols[0].trimmingCharacters(in: .whitespaces)
             let name = cols[1].trimmingCharacters(in: .whitespaces)
             let priceStr = cols[2].trimmingCharacters(in: .whitespaces)
-            let category = cols.count >= 4 ? cols[3].trimmingCharacters(in: .whitespaces) : nil
+            let commodity = cols.count >= 4 ? cols[3].trimmingCharacters(in: .whitespaces) : nil
             // Column 5 is the store (retailer chain). If absent (older
             // catalog format), default to empty string — products with an
             // empty store can only be matched when the AM's selected store
             // is also empty, so these effectively won't scan until the
             // catalog is re-synced with the new format.
             let store = cols.count >= 5 ? cols[4].trimmingCharacters(in: .whitespaces) : ""
+
+            // Column 6: retailPrice (shelf price). Parsed when numeric,
+            // left nil on empty string or unparseable values so one bad
+            // row doesn't tank the whole sync.
+            var retailPrice: Decimal? = nil
+            if cols.count >= 6 {
+                let s = cols[5].trimmingCharacters(in: .whitespaces)
+                if !s.isEmpty {
+                    let d = NSDecimalNumber(string: s)
+                    if d != .notANumber { retailPrice = d as Decimal }
+                }
+            }
+            // Column 7: rank (merchandising priority, lower is better).
+            // Same lenient rules as retailPrice.
+            var rank: Int? = nil
+            if cols.count >= 7 {
+                let s = cols[6].trimmingCharacters(in: .whitespaces)
+                if !s.isEmpty { rank = Int(s) }
+            }
 
             let decimal = NSDecimalNumber(string: priceStr)
             guard decimal != .notANumber else {
@@ -853,8 +915,10 @@ actor SyncService {
                 upc: upc,
                 name: name,
                 price: decimal as Decimal,
-                category: category,
-                store: store
+                commodity: commodity,
+                store: store,
+                retailPrice: retailPrice,
+                rank: rank
             ))
         }
         return result
@@ -872,8 +936,10 @@ actor SyncService {
                 upc: p.upc,
                 name: p.name,
                 price: p.price,
-                category: p.category,
+                commodity: p.commodity,
                 store: p.store,
+                retailPrice: p.retailPrice,
+                rank: p.rank,
                 lastUpdated: now
             ))
         }
@@ -979,15 +1045,21 @@ actor SyncService {
     // MARK: Stores sync
     //
     // CSV format expected (first row is header):
-    //   store,storeNumber
-    //   Target,1842
-    //   Target,4213
-    //   Walmart,0051
+    //   store,storeNumber,area,shortName
+    //   Target,1842,Seattle-North,TGT
+    //   Target,4213,Seattle-North,TGT
+    //   Walmart,0051,Seattle-North,WMT
+    //
+    // Columns 3 (area) and 4 (shortName) are optional for backward
+    // compatibility — older CSVs with just `store,storeNumber` still
+    // parse cleanly. shortName, when present, is shown in compact UI
+    // (history rows, pickers) in place of the full store name.
 
     struct ParsedStore {
         let store: String
         let storeNumber: String
         let area: String
+        let shortName: String
     }
 
     func syncStores(into container: ModelContainer) async -> StoreSync {
@@ -1020,7 +1092,7 @@ actor SyncService {
             guard cols.count >= 2 else {
                 throw SyncError.malformedCSV(
                     line: idx + 1,
-                    reason: "expected 3 columns: store, storeNumber, area"
+                    reason: "expected at least 2 columns: store, storeNumber [, area, shortName]"
                 )
             }
             let store = cols[0].trimmingCharacters(in: .whitespaces)
@@ -1030,11 +1102,18 @@ actor SyncService {
             // the AM's area. This prevents a partial stores.csv from
             // locking everyone out while the column is being added.
             let area = cols.count >= 3 ? cols[2].trimmingCharacters(in: .whitespaces) : ""
+            // shortName is also optional. When present it's used in
+            // compact UI; when absent the caller falls back to the
+            // full `store` name (see Store.displayName).
+            let shortName = cols.count >= 4 ? cols[3].trimmingCharacters(in: .whitespaces) : ""
 
             guard !store.isEmpty, !storeNumber.isEmpty else {
                 throw SyncError.malformedCSV(line: idx + 1, reason: "store or storeNumber is empty")
             }
-            result.append(ParsedStore(store: store, storeNumber: storeNumber, area: area))
+            result.append(ParsedStore(store: store,
+                                      storeNumber: storeNumber,
+                                      area: area,
+                                      shortName: shortName))
         }
         return result
     }
@@ -1044,7 +1123,10 @@ actor SyncService {
         let context = ModelContext(container)
         try context.delete(model: Store.self)
         for s in parsed {
-            context.insert(Store(store: s.store, storeNumber: s.storeNumber, area: s.area))
+            context.insert(Store(store: s.store,
+                                 storeNumber: s.storeNumber,
+                                 area: s.area,
+                                 shortName: s.shortName))
         }
         try context.save()
         return parsed.count
@@ -1165,31 +1247,17 @@ private extension UInt32 {
 
 // MARK: - Launch coordinator & onboarding
 
-// Root gate: picks between the onboarding screens and the main app.
-// The decision is driven by two signals:
-//   1. Is there a local AreaManager roster? (SwiftData fetchCount)
-//   2. Has the AM selected who they are? (@AppStorage)
-// Either missing signal holds the user on the corresponding onboarding
-// screen. Once both are satisfied, RootTabView takes over.
+// Root gate: waits for the roster to sync, then shows the main app.
+// Once at least one AreaManager is in SwiftData, RootTabView takes over.
 struct LaunchCoordinator: View {
-    @Environment(\.modelContext) private var context
-    @Environment(ScanSessionStore.self) private var store
-    @AppStorage("currentEmployeeNumber") private var currentEmployeeNumber: String = ""
-
     @Query private var managers: [AreaManager]
 
     var body: some View {
         Group {
             if managers.isEmpty {
                 LoadingRosterView()
-            } else if currentEmployeeNumber.isEmpty {
-                AMPickerView { selected in
-                    currentEmployeeNumber = selected.employeeNumber
-                    store.currentEmployeeNumber = selected.employeeNumber
-                }
             } else {
                 RootTabView()
-                    .onAppear { store.currentEmployeeNumber = currentEmployeeNumber }
             }
         }
     }
@@ -1211,7 +1279,7 @@ struct LoadingRosterView: View {
                 .frame(width: 72, height: 72)
                 .background(Color.accentColor.opacity(0.12))
                 .clipShape(RoundedRectangle(cornerRadius: 14))
-            Text("AM Credit Tracker").font(.title3).fontWeight(.medium)
+            Text("Jacent Backstock Tracker").font(.title3).fontWeight(.medium)
             Text("Loading your area manager roster from Google Drive.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -1255,137 +1323,6 @@ struct LoadingRosterView: View {
     }
 }
 
-// AM picker — grouped by territory then area, searchable, with the
-// selected row highlighted and a sticky "Continue as X" button at the
-// bottom. Completing this flow sets @AppStorage so subsequent launches
-// skip straight to the main app.
-struct AMPickerView: View {
-    let onSelect: (AreaManager) -> Void
-
-    @Query(sort: [
-        SortDescriptor(\AreaManager.territory),
-        SortDescriptor(\AreaManager.area),
-        SortDescriptor(\AreaManager.lastName)
-    ]) private var allManagers: [AreaManager]
-
-    @State private var search: String = ""
-    @State private var selected: AreaManager?
-    @State private var showWelcome = false
-
-    private var filtered: [AreaManager] {
-        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !q.isEmpty else { return allManagers }
-        return allManagers.filter {
-            $0.firstName.lowercased().contains(q)
-            || $0.lastName.lowercased().contains(q)
-            || $0.employeeNumber.lowercased().contains(q)
-        }
-    }
-
-    private var grouped: [(header: String, managers: [AreaManager])] {
-        let dict = Dictionary(grouping: filtered) { "\($0.territory) · \($0.area)" }
-        return dict.keys.sorted().map { ($0, dict[$0] ?? []) }
-    }
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                List {
-                    ForEach(grouped, id: \.header) { group in
-                        Section(group.header) {
-                            ForEach(group.managers) { am in
-                                Button {
-                                    selected = am
-                                } label: {
-                                    HStack {
-                                        Text(am.fullName).foregroundStyle(.primary)
-                                        Spacer()
-                                    }
-                                    .contentShape(Rectangle())
-                                }
-                                .listRowBackground(
-                                    selected?.employeeNumber == am.employeeNumber
-                                    ? Color.accentColor.opacity(0.12) : Color(.systemBackground)
-                                )
-                            }
-                        }
-                    }
-                }
-                .searchable(text: $search, prompt: "Search by name")
-                .listStyle(.insetGrouped)
-
-                if let selected {
-                    VStack(spacing: 0) {
-                        Divider()
-                        Button {
-                            showWelcome = true
-                        } label: {
-                            Text("Continue as \(selected.fullName)")
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 4)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .padding()
-                    }
-                    .background(.ultraThinMaterial)
-                }
-            }
-            .navigationTitle("Who's using this device?")
-            .navigationBarTitleDisplayMode(.inline)
-            .sheet(isPresented: $showWelcome) {
-                if let selected {
-                    WelcomeView(manager: selected) {
-                        onSelect(selected)
-                        showWelcome = false
-                    }
-                }
-            }
-        }
-    }
-}
-
-// Shown once after AM selection to reinforce the audit-log attribution.
-// Tapping "Start scanning" commits the selection via the picker's callback.
-struct WelcomeView: View {
-    let manager: AreaManager
-    let onStart: () -> Void
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Spacer()
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 56))
-                .foregroundStyle(.green)
-            Text("Welcome, \(manager.firstName)")
-                .font(.title3).fontWeight(.medium)
-            Text("You're signed in as the area manager for \(manager.area). Your scans will be tagged with your employee number in the audit log.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-
-            VStack(spacing: 8) {
-                LabeledContent("Territory", value: manager.territory)
-                LabeledContent("Area", value: manager.area)
-            }
-            .padding()
-            .background(Color(.secondarySystemBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-            .padding(.horizontal, 32)
-
-            Button("Start scanning", action: onStart)
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .padding(.horizontal, 32)
-
-            Text("You can change AMs later in Settings")
-                .font(.caption).foregroundStyle(.tertiary)
-            Spacer()
-        }
-        .presentationDetents([.large])
-    }
-}
-
 // MARK: - Root tab view
 
 struct RootTabView: View {
@@ -1402,6 +1339,22 @@ struct RootTabView: View {
 }
 
 // MARK: - Scan view
+
+private enum ScanSortOrder: String, CaseIterable {
+    // Default. Merchandising rank from the catalog (lower is better);
+    // items without a rank fall to the bottom of the list.
+    case rank      = "Rank"
+    case scanOrder = "Scan order"
+    case nameAZ    = "Name A→Z"
+    case nameZA    = "Name Z→A"
+    case priceHigh = "Price: High–Low"
+    case priceLow  = "Price: Low–High"
+}
+
+private enum ScanFilterMode: String, CaseIterable {
+    case all        = "All items"
+    case manualOnly = "Manual overrides"
+}
 
 struct ScanView: View {
     @Environment(ScanSessionStore.self) private var store
@@ -1436,27 +1389,6 @@ struct ScanView: View {
     @AppStorage("selectedStore") private var selectedStore: String = ""
     @AppStorage("selectedStoreNumber") private var selectedStoreNumber: String = ""
 
-    // Signed-in AM's employee number. Used to scope the store picker
-    // to this AM's area (a Seattle-North AM only sees Seattle-North
-    // stores — AMs have both a broader 'territory' and a specific 'area',
-    // and stores partition by area).
-    @AppStorage("currentEmployeeNumber") private var currentEmployeeNumber: String = ""
-    @Query private var allManagers: [AreaManager]
-
-    // Resolve the signed-in AM's area, or "" if not yet signed in or
-    // not found in the roster. Empty string = no area filter, all
-    // stores visible (fail-open rather than fail-closed).
-    private var currentAMArea: String {
-        guard !currentEmployeeNumber.isEmpty else { return "" }
-        return allManagers.first { $0.employeeNumber == currentEmployeeNumber }?.area ?? ""
-    }
-
-    // The full AreaManager record for the signed-in AM.
-    private var currentAM: AreaManager? {
-        guard !currentEmployeeNumber.isEmpty else { return nil }
-        return allManagers.first { $0.employeeNumber == currentEmployeeNumber }
-    }
-
     // Drive the empty-catalog and empty-stores banners. When either is
     // empty, scanning will fail — show explicit warnings so the AM knows
     // to sync instead of assuming every product is legitimately missing.
@@ -1489,7 +1421,7 @@ struct ScanView: View {
             }
             .environment(\.editMode, $editMode)
             .scrollDismissesKeyboard(.immediately)
-            .navigationTitle("Credit limit tracker")
+            .navigationTitle("Jacent Backstock Tracker")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -1509,7 +1441,7 @@ struct ScanView: View {
             }
             .onAppear {
                 inputFocused = true
-                validateStoreSelectionForCurrentAM()
+                validateStoreSelection()
             }
             .sheet(isPresented: $showManualOverride) {
                 ManualPriceSheet(upc: missingUPC) { override in
@@ -1625,16 +1557,13 @@ struct ScanView: View {
 
     // Two dependent pickers: store (retailer chain) and store number.
     // Picking a store filters the store-number picker to just the
-    // numbered locations for that chain. Both pickers are further
-    // scoped to the signed-in AM's area so AMs only see the stores
-    // they actually cover.
+    // numbered locations for that chain.
     private var storePickerBar: some View {
         let storeService = StoreService(context: context)
-        let area = currentAMArea
-        let storeNames = storeService.distinctStoreNames(in: area)
+        let storeNames = storeService.distinctStoreNames(in: "")
         let availableNumbers = selectedStore.isEmpty
             ? []
-            : storeService.storeNumbers(for: selectedStore, in: area)
+            : storeService.storeNumbers(for: selectedStore, in: "")
 
         return HStack(spacing: 10) {
             // Store name picker
@@ -1892,17 +1821,16 @@ struct ScanView: View {
     // no longer includes it. Handles the "AM switched accounts" case —
     // otherwise a Seattle-North AM signing in after a Seattle-South AM
     // would be left with a stale Seattle-South store pre-selected.
-    private func validateStoreSelectionForCurrentAM() {
+    private func validateStoreSelection() {
         guard !selectedStore.isEmpty else { return }
-        let area = currentAMArea
         let storeService = StoreService(context: context)
-        let allowedStores = storeService.distinctStoreNames(in: area)
+        let allowedStores = storeService.distinctStoreNames(in: "")
         if !allowedStores.contains(selectedStore) {
             selectedStore = ""
             selectedStoreNumber = ""
             return
         }
-        let allowedNumbers = storeService.storeNumbers(for: selectedStore, in: area)
+        let allowedNumbers = storeService.storeNumbers(for: selectedStore, in: "")
         if !selectedStoreNumber.isEmpty && !allowedNumbers.contains(selectedStoreNumber) {
             selectedStoreNumber = ""
         }
@@ -2163,12 +2091,27 @@ struct SubmitSheet: View {
 
 struct HistoryView: View {
     @Query(sort: \ScanSession.startedAt, order: .reverse) private var sessions: [ScanSession]
+    // All stores are loaded once here and passed down as a lookup map
+    // keyed by storeNumber. Avoids each HistoryRow issuing its own query.
+    @Query private var stores: [Store]
+
+    // storeNumber -> shortName label (first non-empty shortName wins).
+    // Built once per body evaluation; cheap for the roster sizes we expect.
+    private var shortNames: [String: String] {
+        var map: [String: String] = [:]
+        for s in stores where !s.shortName.isEmpty {
+            if map[s.storeNumber] == nil {
+                map[s.storeNumber] = s.shortName
+            }
+        }
+        return map
+    }
 
     var body: some View {
         NavigationStack {
             List(sessions) { session in
                 NavigationLink(value: session.id) {
-                    HistoryRow(session: session)
+                    HistoryRow(session: session, storeShortNames: shortNames)
                 }
             }
             .navigationTitle("History")
@@ -2181,6 +2124,9 @@ struct HistoryView: View {
 
 struct HistoryRow: View {
     let session: ScanSession
+    // Lookup built by HistoryView. Missing keys → no shortname available,
+    // fall back to the generic "Store #..." label.
+    let storeShortNames: [String: String]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -2201,12 +2147,22 @@ struct HistoryRow: View {
         .padding(.vertical, 4)
     }
 
+    // Items summary includes a compact store label when the session
+    // has a storeNumber. Prefers the stores.csv `shortName` ("TGT #1842")
+    // when one is mapped, otherwise falls back to "Store #1842" so rows
+    // from older sessions or un-shortnamed stores still read cleanly.
     private var itemsSummary: String {
         let lines = session.items.count
         let units = session.items.reduce(0) { $0 + $1.quantity }
-        return lines == units
+        let base = lines == units
             ? "\(lines) items"
             : "\(lines) items · \(units) units"
+        guard let storeNumber = session.storeNumber, !storeNumber.isEmpty else {
+            return base
+        }
+        let label = storeShortNames[storeNumber].map { "\($0) #\(storeNumber)" }
+            ?? "Store #\(storeNumber)"
+        return "\(base) · \(label)"
     }
 }
 
@@ -2251,11 +2207,92 @@ struct StatusPill: View {
 struct SessionDetailView: View {
     let sessionID: UUID
     @Query private var sessions: [ScanSession]
-    @Query private var allManagers: [AreaManager]
+
+    @Query private var allProducts: [Product]
+    // Used to resolve the session's storeNumber to its shortName for
+    // display in the header. Falls back to "Store #..." if no shortName
+    // is mapped (same rule as HistoryRow).
+    @Query private var allStores: [Store]
+
+    @State private var shareURL: URL?
+    @State private var showShare = false
+    @State private var mailPayload: MailPayload?
+    @State private var sortOrder: ScanSortOrder   = .rank
+    @State private var filterMode: ScanFilterMode = .all
+    @State private var commoditySearch: String    = ""
 
     init(sessionID: UUID) {
         self.sessionID = sessionID
         _sessions = Query(filter: #Predicate<ScanSession> { $0.id == sessionID })
+    }
+
+    private var isFiltered: Bool {
+        filterMode != .all || sortOrder != .rank || !commoditySearch.isEmpty
+    }
+
+    // Looks up the commodity for a UPC from the current catalog.
+    // Commodity wasn't denormalized onto ScannedItem at scan time, so we
+    // resolve it live. Acceptable for filtering; historical accuracy of
+    // the commodity field isn't critical.
+    private func commodity(for upc: String) -> String? {
+        allProducts.first { $0.upc == upc }?.commodity
+    }
+
+    // Looks up the merchandising rank for a UPC. Like commodity, not
+    // denormalized onto ScannedItem — resolved live from the current
+    // catalog. Missing / unranked items get Int.max so they sort last.
+    private func rank(for upc: String) -> Int {
+        allProducts.first { $0.upc == upc }?.rank ?? Int.max
+    }
+
+    // Looks up the retail (shelf) price for a UPC. Returns nil when
+    // the catalog row doesn't carry one, so the UI can silently omit
+    // the "retail" badge rather than show a placeholder.
+    private func retailPrice(for upc: String) -> Decimal? {
+        allProducts.first { $0.upc == upc }?.retailPrice
+    }
+
+    // Resolves the session's storeNumber to a compact header label.
+    // Prefers the stores.csv `shortName` ("TGT #1842"); if no Store
+    // row is found or its shortName is empty, falls back to the
+    // generic "Store #1842" — same rule as HistoryRow, so the two
+    // surfaces stay in sync.
+    private func storeLabel(for storeNumber: String) -> String {
+        if let match = allStores.first(where: { $0.storeNumber == storeNumber }),
+           !match.shortName.isEmpty {
+            return "\(match.shortName) #\(storeNumber)"
+        }
+        return "Store #\(storeNumber)"
+    }
+
+
+    private func displayedItems(for session: ScanSession) -> [ScannedItem] {
+        let base = session.items.sorted { $0.scannedAt < $1.scannedAt }
+        var filtered: [ScannedItem]
+        switch filterMode {
+        case .all:        filtered = base
+        case .manualOnly: filtered = base.filter { $0.manualOverride }
+        }
+        if !commoditySearch.isEmpty {
+            let q = commoditySearch.lowercased()
+            filtered = filtered.filter { (commodity(for: $0.upc) ?? "").lowercased().contains(q) }
+        }
+        switch sortOrder {
+        case .rank:
+            // Rank ascending (lower is better), ties broken by the
+            // session's scan order so the list stays stable.
+            return filtered.sorted { a, b in
+                let ra = rank(for: a.upc)
+                let rb = rank(for: b.upc)
+                if ra != rb { return ra < rb }
+                return a.scannedAt < b.scannedAt
+            }
+        case .scanOrder:  return filtered
+        case .nameAZ:     return filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        case .nameZA:     return filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedDescending }
+        case .priceHigh:  return filtered.sorted { $0.price > $1.price }
+        case .priceLow:   return filtered.sorted { $0.price < $1.price }
+        }
     }
 
     var body: some View {
@@ -2272,6 +2309,73 @@ struct SessionDetailView: View {
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Session detail")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Menu {
+                        Section("Sort") {
+                            ForEach(ScanSortOrder.allCases, id: \.self) { order in
+                                Button {
+                                    sortOrder = order
+                                } label: {
+                                    if sortOrder == order {
+                                        Label(order.rawValue, systemImage: "checkmark")
+                                    } else {
+                                        Text(order.rawValue)
+                                    }
+                                }
+                            }
+                        }
+                        Section("Filter") {
+                            ForEach(ScanFilterMode.allCases, id: \.self) { mode in
+                                Button {
+                                    filterMode = mode
+                                } label: {
+                                    if filterMode == mode {
+                                        Label(mode.rawValue, systemImage: "checkmark")
+                                    } else {
+                                        Text(mode.rawValue)
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        Image(systemName: isFiltered
+                              ? "line.3.horizontal.decrease.circle.fill"
+                              : "line.3.horizontal.decrease.circle")
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button {
+                            shareURL = csvURL(for: session)
+                            showShare = shareURL != nil
+                        } label: {
+                            Label("Export CSV", systemImage: "square.and.arrow.up")
+                        }
+                        Button {
+                            printSession(session)
+                        } label: {
+                            Label("Print", systemImage: "printer")
+                        }
+                        Button {
+                            emailSession(session)
+                        } label: {
+                            Label("Email", systemImage: "envelope")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
+            }
+            .sheet(isPresented: $showShare) {
+                if let url = shareURL {
+                    ActivityView(items: [url])
+                }
+            }
+            .fullScreenCover(item: $mailPayload) { payload in
+                MailComposerView(payload: payload)
+                    .ignoresSafeArea()
+            }
         } else {
             VStack(spacing: 12) {
                 Image(systemName: "exclamationmark.circle")
@@ -2289,55 +2393,108 @@ struct SessionDetailView: View {
     // MARK: - Sections
 
     private func headerSection(session: ScanSession) -> some View {
-        VStack(spacing: 10) {
-            VStack(spacing: 4) {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(formatCurrency(session.totalAmount))
-                    .font(.system(size: 38, weight: .medium))
-                Text(session.submittedAt ?? session.startedAt, format: .dateTime.month(.wide).day().year().hour().minute())
+                    .font(.title3).fontWeight(.semibold)
+                Text(session.submittedAt ?? session.startedAt,
+                     format: .dateTime.month(.wide).day().year().hour().minute())
                     .font(.caption).foregroundStyle(.secondary)
             }
-            .padding(.top, 20)
-
-            StatusPill(status: session.status)
-
-            // Store and AM attribution
-            VStack(spacing: 2) {
-                if let storeNumber = session.storeNumber, !storeNumber.isEmpty {
-                    Text("Store #\(storeNumber)")
-                        .font(.subheadline).fontWeight(.medium)
+            Spacer()
+            VStack(alignment: .trailing, spacing: 4) {
+                if session.status != .submitted {
+                    StatusPill(status: session.status)
                 }
-                if let amName = amName(for: session.employeeNumber) {
-                    Text(amName)
+                if let storeNumber = session.storeNumber, !storeNumber.isEmpty {
+                    Text(storeLabel(for: storeNumber))
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Text("Employee #\(session.employeeNumber)")
-                    .font(.caption2).foregroundStyle(.tertiary).monospaced()
             }
-            .padding(.top, 4)
         }
-        .frame(maxWidth: .infinity)
         .padding(.horizontal, 20)
-        .padding(.bottom, 20)
+        .padding(.vertical, 14)
         .background(Color(.systemBackground))
     }
 
     private func lineItemsSection(session: ScanSession) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Line items")
-                .font(.caption).fontWeight(.medium)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 20)
-                .padding(.top, 20)
-                .padding(.bottom, 8)
+            HStack {
+                Text("Line items")
+                    .font(.caption).fontWeight(.medium)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if isFiltered {
+                    let shown = displayedItems(for: session).count
+                    let total = session.items.count
+                    Text("\(shown) of \(total)")
+                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 4)
 
-            // Sort by scannedAt so the display order matches how the
-            // AM scanned them in the session, not the insertion order
-            // the SwiftData relationship happens to return.
-            let sorted = session.items.sorted { $0.scannedAt < $1.scannedAt }
+            // Commodity search field
             VStack(spacing: 0) {
-                ForEach(Array(sorted.enumerated()), id: \.element.id) { idx, item in
+                HStack(spacing: 8) {
+                    Image(systemName: "tag")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                    TextField("Filter by commodity", text: $commoditySearch)
+                        .font(.subheadline)
+                        .autocorrectionDisabled()
+                    if !commoditySearch.isEmpty {
+                        Button {
+                            commoditySearch = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .padding(.horizontal, 20)
+                .padding(.top, 4)
+                .padding(.bottom, 8)
+            }
+
+            // Active sort/filter indicator + Clear
+            if isFiltered {
+                HStack(spacing: 8) {
+                    if !commoditySearch.isEmpty {
+                        Label(commoditySearch, systemImage: "tag")
+                            .font(.caption2).foregroundStyle(.tint)
+                    }
+                    if filterMode != .all {
+                        Label(filterMode.rawValue, systemImage: "line.3.horizontal.decrease")
+                            .font(.caption2).foregroundStyle(.tint)
+                    }
+                    if sortOrder != .rank {
+                        Label(sortOrder.rawValue, systemImage: "arrow.up.arrow.down")
+                            .font(.caption2).foregroundStyle(.tint)
+                    }
+                    Spacer()
+                    Button("Clear all") {
+                        sortOrder       = .rank
+                        filterMode      = .all
+                        commoditySearch = ""
+                    }
+                    .font(.caption2).foregroundStyle(.tint)
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 8)
+            }
+
+            let items = displayedItems(for: session)
+            VStack(spacing: 0) {
+                ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
                     lineItemRow(item: item, index: idx + 1)
-                    if idx < sorted.count - 1 {
+                    if idx < items.count - 1 {
                         Divider().padding(.leading, 20)
                     }
                 }
@@ -2345,6 +2502,7 @@ struct SessionDetailView: View {
             .background(Color(.systemBackground))
         }
     }
+
 
     private func lineItemRow(item: ScannedItem, index: Int) -> some View {
         HStack(alignment: .top, spacing: 12) {
@@ -2366,9 +2524,26 @@ struct SessionDetailView: View {
                             .clipShape(Capsule())
                     }
                 }
-                Text(item.upc)
-                    .font(.caption2).monospaced()
-                    .foregroundStyle(.tertiary)
+                HStack(spacing: 6) {
+                    Text(item.upc)
+                        .font(.caption2).monospaced()
+                        .foregroundStyle(.tertiary)
+                    if let com = commodity(for: item.upc) {
+                        Text("·").font(.caption2).foregroundStyle(.tertiary)
+                        Text(com)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    // Rank badge — skipped for items that don't carry
+                    // one (rank(for:) returns Int.max as sentinel).
+                    let r = rank(for: item.upc)
+                    if r != Int.max {
+                        Text("·").font(.caption2).foregroundStyle(.tertiary)
+                        Text("Rank \(r)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 if let note = item.overrideNote, !note.isEmpty {
                     Text(note)
                         .font(.caption).italic()
@@ -2381,6 +2556,14 @@ struct SessionDetailView: View {
                     } else {
                         Text(formatCurrency(item.price))
                             .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // Retail price, pulled live from the catalog. Shown
+                    // parenthetically so the credit price (above) stays
+                    // the primary number. Skipped when the catalog row
+                    // doesn't carry a retailPrice.
+                    if let rp = retailPrice(for: item.upc) {
+                        Text("(retail \(formatCurrency(rp)))")
+                            .font(.caption2).foregroundStyle(.tertiary)
                     }
                 }
             }
@@ -2395,12 +2578,27 @@ struct SessionDetailView: View {
 
     private func totalsSection(session: ScanSession) -> some View {
         let totalUnits = session.items.reduce(0) { $0 + $1.quantity }
+        // Sum retailPrice × quantity for every line where the catalog
+        // carries a retail price. Items without a retail price contribute
+        // zero — the badge above each line already signals "no retail on
+        // file," so we don't double-warn here.
+        let retailTotal: Decimal = session.items.reduce(Decimal(0)) { acc, item in
+            guard let rp = retailPrice(for: item.upc) else { return acc }
+            return acc + rp * Decimal(item.quantity)
+        }
         return VStack(spacing: 0) {
             totalsRow(label: "Line items", value: "\(session.items.count)")
             Divider().padding(.leading, 20)
             totalsRow(label: "Total units", value: "\(totalUnits)")
             Divider().padding(.leading, 20)
             totalsRow(label: "Total", value: formatCurrency(session.totalAmount), emphasize: true)
+            // Retail total is only meaningful when at least one item
+            // had a retailPrice. A zero total most likely means the
+            // catalog hasn't been synced with the retail column yet.
+            if retailTotal > 0 {
+                Divider().padding(.leading, 20)
+                totalsRow(label: "Total retail", value: formatCurrency(retailTotal))
+            }
         }
         .background(Color(.systemBackground))
         .padding(.top, 20)
@@ -2477,15 +2675,178 @@ struct SessionDetailView: View {
 
     // MARK: - Helpers
 
-    private func amName(for employeeNumber: String) -> String? {
-        allManagers.first { $0.employeeNumber == employeeNumber }?.fullName
-    }
-
     private func formatCurrency(_ value: Decimal) -> String {
         let f = NumberFormatter()
         f.numberStyle = .currency
         f.locale = Locale(identifier: "en_US")
         return f.string(from: value as NSDecimalNumber) ?? "$\(value)"
+    }
+
+    // Writes a CSV to the temp directory and returns its URL, or nil on failure.
+    private func csvURL(for session: ScanSession) -> URL? {
+        let sorted = session.items.sorted { $0.scannedAt < $1.scannedAt }
+        var lines = ["#,Name,UPC,Qty,Unit Price,Line Total,Manual,Note"]
+        for (idx, item) in sorted.enumerated() {
+            func esc(_ s: String) -> String { "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\"" }
+            lines.append([
+                "\(idx + 1)",
+                esc(item.name),
+                item.upc,
+                "\(item.quantity)",
+                "\(item.price)",
+                "\(item.lineTotal)",
+                item.manualOverride ? "yes" : "no",
+                esc(item.overrideNote ?? "")
+            ].joined(separator: ","))
+        }
+        let csv = lines.joined(separator: "\n")
+        let name = "session-\(session.id.uuidString.prefix(8)).csv"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do {
+            try csv.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    // Renders the session as HTML and sends it to the system print panel.
+    private func printSession(_ session: ScanSession) {
+        let sorted = session.items.sorted { $0.scannedAt < $1.scannedAt }
+        let dateStr = (session.submittedAt ?? session.startedAt)
+            .formatted(date: .long, time: .shortened)
+        let storeLine = session.storeNumber.map { " · \(storeLabel(for: $0))" } ?? ""
+
+        let rows = sorted.enumerated().map { idx, item -> String in
+            let tag = item.manualOverride
+                ? " <span class='tag'>manual</span>" : ""
+            let note = item.overrideNote.map { "<br><em>\($0)</em>" } ?? ""
+            return """
+            <tr>
+              <td>\(idx + 1)</td>
+              <td>\(item.name)\(tag)\(note)<br><small>\(item.upc)</small></td>
+              <td>\(item.quantity)</td>
+              <td>\(formatCurrency(item.price))</td>
+              <td>\(formatCurrency(item.lineTotal))</td>
+            </tr>
+            """
+        }.joined()
+
+        let html = """
+        <!DOCTYPE html><html><head><meta charset="utf-8">
+        <style>
+          body { font-family: -apple-system, sans-serif; font-size: 13px; margin: 32px; }
+          h2 { margin-bottom: 4px; }
+          .meta { color: #666; margin-bottom: 20px; font-size: 12px; }
+          table { width: 100%; border-collapse: collapse; }
+          th { text-align: left; border-bottom: 2px solid #000; padding: 6px 8px; font-size: 12px; }
+          td { padding: 6px 8px; border-bottom: 1px solid #ddd; vertical-align: top; }
+          td:nth-child(n+3), th:nth-child(n+3) { text-align: right; }
+          small { color: #888; font-family: monospace; }
+          .tag { background: #fff3cd; padding: 1px 5px; border-radius: 4px; font-size: 11px; }
+          tfoot td { font-weight: bold; border-top: 2px solid #000; }
+        </style></head><body>
+        <h2>Jacent Backstock Tracker</h2>
+        <div class="meta">\(dateStr)\(storeLine) · \(formatCurrency(session.totalAmount))</div>
+        <table>
+          <thead><tr><th>#</th><th>Product</th><th>Qty</th><th>Unit</th><th>Total</th></tr></thead>
+          <tbody>\(rows)</tbody>
+          <tfoot><tr><td colspan="4">Total</td><td>\(formatCurrency(session.totalAmount))</td></tr></tfoot>
+        </table>
+        </body></html>
+        """
+
+        let formatter = UIMarkupTextPrintFormatter(markupText: html)
+        let info = UIPrintInfo(dictionary: nil)
+        info.outputType = .general
+        info.jobName = "Backstock Session \(dateStr)"
+        let controller = UIPrintInteractionController.shared
+        controller.printInfo = info
+        controller.printFormatter = formatter
+        controller.present(animated: true)
+    }
+
+    // Prepares the mail payload and opens the composer. Falls back to
+    // the system share sheet on devices without a configured mail account
+    // (e.g. the simulator) so the user can still hand the CSV off.
+    private func emailSession(_ session: ScanSession) {
+        let sorted  = session.items.sorted { $0.scannedAt < $1.scannedAt }
+        let dateStr = (session.submittedAt ?? session.startedAt)
+            .formatted(date: .long, time: .shortened)
+        let storeLine = session.storeNumber.map { " · \(storeLabel(for: $0))" } ?? ""
+
+        let subject = "Backstock session — \(dateStr)"
+
+        var body = """
+        Jacent Backstock Tracker session
+        \(dateStr)\(storeLine)
+        Total: \(formatCurrency(session.totalAmount))
+        Items: \(session.items.count) lines
+
+        """
+        for (idx, item) in sorted.enumerated() {
+            let qty = item.quantity > 1 ? " (×\(item.quantity))" : ""
+            let note = item.overrideNote.map { " — \($0)" } ?? ""
+            body += "\n\(idx + 1). \(item.name)\(qty) — \(formatCurrency(item.lineTotal))  [\(item.upc)]\(note)"
+        }
+        body += "\n\nTotal: \(formatCurrency(session.totalAmount))\n"
+
+        let csv = csvURL(for: session)
+
+        if MFMailComposeViewController.canSendMail() {
+            mailPayload = MailPayload(subject: subject, body: body, attachment: csv)
+        } else if let csv {
+            // Simulator / no mail account — hand the CSV to the share
+            // sheet so the user can pick Mail (or anything else) manually.
+            shareURL  = csv
+            showShare = true
+        }
+    }
+
+    private struct ActivityView: UIViewControllerRepresentable {
+        let items: [Any]
+        func makeUIViewController(context: Context) -> UIActivityViewController {
+            UIActivityViewController(activityItems: items, applicationActivities: nil)
+        }
+        func updateUIViewController(_ uvc: UIActivityViewController, context: Context) {}
+    }
+
+    struct MailPayload: Identifiable {
+        let id = UUID()
+        let subject: String
+        let body: String
+        let attachment: URL?
+    }
+
+    private struct MailComposerView: UIViewControllerRepresentable {
+        let payload: MailPayload
+        @Environment(\.dismiss) private var dismiss
+
+        func makeUIViewController(context: Context) -> MFMailComposeViewController {
+            let vc = MFMailComposeViewController()
+            vc.mailComposeDelegate = context.coordinator
+            vc.setSubject(payload.subject)
+            vc.setMessageBody(payload.body, isHTML: false)
+            if let url = payload.attachment,
+               let data = try? Data(contentsOf: url) {
+                vc.addAttachmentData(data, mimeType: "text/csv", fileName: url.lastPathComponent)
+            }
+            return vc
+        }
+
+        func updateUIViewController(_ vc: MFMailComposeViewController, context: Context) {}
+
+        func makeCoordinator() -> Coordinator { Coordinator(dismiss: { dismiss() }) }
+
+        final class Coordinator: NSObject, MFMailComposeViewControllerDelegate {
+            let dismiss: () -> Void
+            init(dismiss: @escaping () -> Void) { self.dismiss = dismiss }
+            func mailComposeController(_ controller: MFMailComposeViewController,
+                                       didFinishWith result: MFMailComposeResult,
+                                       error: Error?) {
+                dismiss()
+            }
+        }
     }
 }
 
@@ -2522,28 +2883,9 @@ struct SettingsView: View {
                     LabeledContent("Type", value: "Google Drive")
                     LabeledContent("Access", value: "Anyone with link")
                 }
-                Section("Account") {
-                    if let am = currentManager {
-                        LabeledContent("Name", value: am.fullName)
-                        LabeledContent("Employee #", value: am.employeeNumber)
-                        LabeledContent("Territory", value: am.territory)
-                        LabeledContent("Area", value: am.area)
-                    } else {
-                        Text("No AM selected").foregroundStyle(.secondary)
-                    }
-                    Button("Change area manager", role: .destructive) {
-                        currentEmployeeNumber = ""
-                    }
-                }
             }
             .navigationTitle("Settings")
         }
-    }
-
-    @AppStorage("currentEmployeeNumber") private var currentEmployeeNumber: String = ""
-    @Query private var allManagers: [AreaManager]
-    private var currentManager: AreaManager? {
-        allManagers.first { $0.employeeNumber == currentEmployeeNumber }
     }
 
     private func runSync() async {
@@ -2763,12 +3105,12 @@ struct DataScannerRepresentable: UIViewControllerRepresentable {
 
 // Register this task identifier in Info.plist under
 // "Permitted background task scheduler identifiers":
-//   com.jacent.amcredit.catalog-sync
+//   com.jacent.backstock.catalog-sync
 //
 // Then in your AppDelegate / App init:
 //
 //   BGTaskScheduler.shared.register(
-//       forTaskWithIdentifier: "com.jacent.amcredit.catalog-sync",
+//       forTaskWithIdentifier: "com.jacent.backstock.catalog-sync",
 //       using: nil
 //   ) { task in
 //       Task {
@@ -2781,6 +3123,6 @@ struct DataScannerRepresentable: UIViewControllerRepresentable {
 //
 // And schedule it after successful foreground syncs:
 //
-//   let req = BGAppRefreshTaskRequest(identifier: "com.jacent.amcredit.catalog-sync")
+//   let req = BGAppRefreshTaskRequest(identifier: "com.jacent.backstock.catalog-sync")
 //   req.earliestBeginDate = Date(timeIntervalSinceNow: 6 * 60 * 60)
 //   try? BGTaskScheduler.shared.submit(req)
