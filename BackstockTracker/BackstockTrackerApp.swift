@@ -333,6 +333,10 @@ final class ScanSession {
     var statusRaw: String
     var notes: String?
     var storeNumber: String?
+    // Physical box this session is packed into — 1…10, picked on the
+    // scan screen alongside store + store number. Optional so pre-box
+    // sessions and "I forgot to pick" cases don't crash.
+    var box: Int?
     var catalogSyncedAt: Date?           // catalog freshness at session time
 
     // Relationship: a session has many scanned items. Deleting a session
@@ -350,6 +354,7 @@ final class ScanSession {
          startedAt: Date = .now,
          status: SessionStatus = .active,
          storeNumber: String? = nil,
+         box: Int? = nil,
          catalogSyncedAt: Date? = nil) {
         self.id = id
         self.employeeNumber = employeeNumber
@@ -359,6 +364,7 @@ final class ScanSession {
         self.statusRaw = status.rawValue
         self.notes = nil
         self.storeNumber = storeNumber
+        self.box = box
         self.catalogSyncedAt = catalogSyncedAt
     }
 }
@@ -542,6 +548,9 @@ final class ScanSessionStore {
     var items: [InMemoryItem] = []
     var currentEmployeeNumber: String = "UNASSIGNED"
     var currentStoreNumber: String?
+    // Physical box number picked on the scan screen. Copied onto the
+    // persisted ScanSession at submit time. nil = no box picked yet.
+    var currentBox: Int?
 
     var subtotal: Decimal {
         items.reduce(0) { $0 + $1.lineTotal }
@@ -574,6 +583,7 @@ final class ScanSessionStore {
             employeeNumber: currentEmployeeNumber,
             status: .submitted,
             storeNumber: currentStoreNumber,
+            box: currentBox,
             catalogSyncedAt: catalogSyncedAt
         )
         session.submittedAt = .now
@@ -1247,18 +1257,85 @@ private extension UInt32 {
 
 // MARK: - Launch coordinator & onboarding
 
-// Root gate: waits for the roster to sync, then shows the main app.
-// Once at least one AreaManager is in SwiftData, RootTabView takes over.
+// Root gate: waits for the roster to sync, then makes sure the AM has
+// picked an area before handing off to the main app. The area drives
+// the store picker in ScanView and is how we scope an AM's work to
+// their slice of the territory. Once the roster is in SwiftData AND
+// an area is saved in @AppStorage, RootTabView takes over.
 struct LaunchCoordinator: View {
     @Query private var managers: [AreaManager]
+    @AppStorage("selectedArea") private var selectedArea: String = ""
 
     var body: some View {
         Group {
             if managers.isEmpty {
                 LoadingRosterView()
+            } else if selectedArea.isEmpty {
+                AreaPickerView()
             } else {
                 RootTabView()
             }
+        }
+    }
+}
+
+// First-run area picker. Shown after the roster loads but before
+// RootTabView appears, and reused from Settings via sheet presentation
+// when the AM needs to change areas later. Populated from the distinct
+// `area` values in the AreaManager roster — these are the officially
+// deployed areas, not derived from wherever stores happen to exist.
+struct AreaPickerView: View {
+    @Query private var managers: [AreaManager]
+    @AppStorage("selectedArea") private var selectedArea: String = ""
+    // When presented as a sheet from Settings, `onPicked` fires so the
+    // caller can clear store selection and dismiss. Default no-op keeps
+    // the first-run use site simple.
+    var onPicked: (() -> Void)? = nil
+    @Environment(\.dismiss) private var dismiss
+
+    private var areas: [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for m in managers where !m.area.isEmpty {
+            if !seen.contains(m.area) {
+                seen.insert(m.area)
+                result.append(m.area)
+            }
+        }
+        return result.sorted()
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if areas.isEmpty {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("Loading areas…")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List(areas, id: \.self) { area in
+                        Button {
+                            selectedArea = area
+                            onPicked?()
+                            dismiss()
+                        } label: {
+                            HStack {
+                                Text(area).foregroundStyle(.primary)
+                                Spacer()
+                                if selectedArea == area {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(.tint)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Choose your area")
+            .navigationBarTitleDisplayMode(.inline)
         }
     }
 }
@@ -1388,6 +1465,16 @@ struct ScanView: View {
     // selection is a kindness. Empty strings mean "not yet selected."
     @AppStorage("selectedStore") private var selectedStore: String = ""
     @AppStorage("selectedStoreNumber") private var selectedStoreNumber: String = ""
+    // The AM's currently selected area. Drives the filter on both
+    // store-name and store-number pickers. LaunchCoordinator guarantees
+    // this is non-empty before ScanView mounts.
+    @AppStorage("selectedArea") private var selectedArea: String = ""
+    // Physical box number (1…10) the current session will be recorded
+    // against. Stored in @AppStorage so the AM doesn't lose their box
+    // if the app gets backgrounded mid-scan, but changes to it are
+    // cheap — they can bump it for every new box through the day. 0
+    // = not yet picked; treated as nil on the persisted session.
+    @AppStorage("selectedBox") private var selectedBox: Int = 0
 
     // Drive the empty-catalog and empty-stores banners. When either is
     // empty, scanning will fail — show explicit warnings so the AM knows
@@ -1441,6 +1528,12 @@ struct ScanView: View {
             }
             .onAppear {
                 inputFocused = true
+                validateStoreSelection()
+            }
+            // If the AM changes area from Settings while ScanView is
+            // alive in another tab, revalidate the store selection so
+            // a stale pick doesn't linger into the next scan.
+            .onChange(of: selectedArea) { _, _ in
                 validateStoreSelection()
             }
             .sheet(isPresented: $showManualOverride) {
@@ -1560,10 +1653,13 @@ struct ScanView: View {
     // numbered locations for that chain.
     private var storePickerBar: some View {
         let storeService = StoreService(context: context)
-        let storeNames = storeService.distinctStoreNames(in: "")
+        // Scope both pickers to the AM's selectedArea so they only see
+        // stores they actually cover. StoreService is already lenient
+        // about rows with empty `area` — those show up for everyone.
+        let storeNames = storeService.distinctStoreNames(in: selectedArea)
         let availableNumbers = selectedStore.isEmpty
             ? []
-            : storeService.storeNumbers(for: selectedStore, in: "")
+            : storeService.storeNumbers(for: selectedStore, in: selectedArea)
 
         return HStack(spacing: 10) {
             // Store name picker
@@ -1635,6 +1731,41 @@ struct ScanView: View {
             }
             .disabled(selectedStore.isEmpty || availableNumbers.isEmpty || !store.items.isEmpty)
             .opacity((selectedStore.isEmpty || !store.items.isEmpty) ? 0.5 : 1.0)
+
+            // Box picker (1–10). Independent of store/store-number —
+            // AMs typically fill one box per session, but the box can
+            // change within a store. Locked once the session has items
+            // so the box can't silently change mid-scan.
+            Menu {
+                ForEach(1...10, id: \.self) { n in
+                    Button {
+                        selectedBox = n
+                    } label: {
+                        HStack {
+                            Text("Box \(n)")
+                            if selectedBox == n {
+                                Spacer()
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(selectedBox == 0 ? "Box" : "Box \(selectedBox)")
+                        .fontWeight(selectedBox == 0 ? .regular : .medium)
+                        .foregroundStyle(selectedBox == 0 ? .secondary : .primary)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            .disabled(!store.items.isEmpty)
+            .opacity(store.items.isEmpty ? 1.0 : 0.5)
 
             Spacer()
         }
@@ -1826,13 +1957,15 @@ struct ScanView: View {
     private func validateStoreSelection() {
         guard !selectedStore.isEmpty else { return }
         let storeService = StoreService(context: context)
-        let allowedStores = storeService.distinctStoreNames(in: "")
+        // Use selectedArea rather than empty-scope, so changing the
+        // area in Settings invalidates stale picks from the prior area.
+        let allowedStores = storeService.distinctStoreNames(in: selectedArea)
         if !allowedStores.contains(selectedStore) {
             selectedStore = ""
             selectedStoreNumber = ""
             return
         }
-        let allowedNumbers = storeService.storeNumbers(for: selectedStore, in: "")
+        let allowedNumbers = storeService.storeNumbers(for: selectedStore, in: selectedArea)
         if !selectedStoreNumber.isEmpty && !allowedNumbers.contains(selectedStoreNumber) {
             selectedStoreNumber = ""
         }
@@ -1882,10 +2015,12 @@ struct ScanView: View {
             }
         }
 
-        // Propagate the current store number to the session store so
-        // that when the AM submits, the session record carries the
-        // correct store number for audit.
+        // Propagate the current store number and box to the session
+        // store so that when the AM submits, the session record carries
+        // both for audit. selectedBox == 0 means "not picked" → nil on
+        // the persisted record.
         store.currentStoreNumber = selectedStoreNumber
+        store.currentBox = selectedBox == 0 ? nil : selectedBox
 
         let catalog = CatalogService(context: context)
         let result = catalog.lookup(upc: upc, store: selectedStore)
@@ -2153,18 +2288,22 @@ struct HistoryRow: View {
     // has a storeNumber. Prefers the stores.csv `shortName` ("TGT #1842")
     // when one is mapped, otherwise falls back to "Store #1842" so rows
     // from older sessions or un-shortnamed stores still read cleanly.
+    // Appends "Box N" when the session carries a box number.
     private var itemsSummary: String {
         let lines = session.items.count
         let units = session.items.reduce(0) { $0 + $1.quantity }
-        let base = lines == units
-            ? "\(lines) items"
-            : "\(lines) items · \(units) units"
-        guard let storeNumber = session.storeNumber, !storeNumber.isEmpty else {
-            return base
+        var parts: [String] = [
+            lines == units ? "\(lines) items" : "\(lines) items · \(units) units"
+        ]
+        if let storeNumber = session.storeNumber, !storeNumber.isEmpty {
+            let label = storeShortNames[storeNumber].map { "\($0) #\(storeNumber)" }
+                ?? "Store #\(storeNumber)"
+            parts.append(label)
         }
-        let label = storeShortNames[storeNumber].map { "\($0) #\(storeNumber)" }
-            ?? "Store #\(storeNumber)"
-        return "\(base) · \(label)"
+        if let box = session.box {
+            parts.append("Box \(box)")
+        }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -2410,6 +2549,10 @@ struct SessionDetailView: View {
                 }
                 if let storeNumber = session.storeNumber, !storeNumber.isEmpty {
                     Text(storeLabel(for: storeNumber))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let box = session.box {
+                    Text("Box \(box)")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -2858,10 +3001,32 @@ struct SettingsView: View {
     @State private var lastSyncMessage: String = ""
     @State private var isStoreSyncing = false
     @State private var lastStoreSyncMessage: String = ""
+    // The AM's current area. Changing it clears the saved store
+    // selection so the Scan tab doesn't try to reuse a store from
+    // the previous area on next launch.
+    @AppStorage("selectedArea") private var selectedArea: String = ""
+    @AppStorage("selectedStore") private var selectedStore: String = ""
+    @AppStorage("selectedStoreNumber") private var selectedStoreNumber: String = ""
+    @State private var showAreaPicker = false
 
     var body: some View {
         NavigationStack {
             Form {
+                Section("Area") {
+                    Button {
+                        showAreaPicker = true
+                    } label: {
+                        HStack {
+                            Text("Current area")
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            Text(selectedArea.isEmpty ? "Not set" : selectedArea)
+                                .foregroundStyle(.secondary)
+                            Image(systemName: "chevron.right")
+                                .font(.caption).foregroundStyle(.tertiary)
+                        }
+                    }
+                }
                 Section("Product catalog") {
                     // TODO: live sync status row + "Sync now" + "View log"
                     Button(isSyncing ? "Syncing…" : "Sync now") {
@@ -2887,6 +3052,17 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .sheet(isPresented: $showAreaPicker) {
+                AreaPickerView {
+                    // Changing area invalidates the prior store + number
+                    // since they belong to the old area's store set.
+                    // validateStoreSelection() will also catch this on
+                    // ScanView's next onChange tick, but clearing here
+                    // keeps the two tabs visually consistent right away.
+                    selectedStore = ""
+                    selectedStoreNumber = ""
+                }
+            }
         }
     }
 
