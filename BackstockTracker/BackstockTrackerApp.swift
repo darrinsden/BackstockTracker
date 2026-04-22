@@ -1601,6 +1601,8 @@ struct ScanView: View {
                 .background(Color(.secondarySystemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 8))
             }
+            .disabled(!store.items.isEmpty)
+            .opacity(store.items.isEmpty ? 1.0 : 0.5)
 
             // Store number picker, dependent on the selected store
             Menu {
@@ -1631,8 +1633,8 @@ struct ScanView: View {
                 .background(Color(.secondarySystemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 8))
             }
-            .disabled(selectedStore.isEmpty || availableNumbers.isEmpty)
-            .opacity(selectedStore.isEmpty ? 0.5 : 1.0)
+            .disabled(selectedStore.isEmpty || availableNumbers.isEmpty || !store.items.isEmpty)
+            .opacity((selectedStore.isEmpty || !store.items.isEmpty) ? 0.5 : 1.0)
 
             Spacer()
         }
