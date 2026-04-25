@@ -46,7 +46,7 @@ Container init currently uses `fatalError("ModelContainer failed: \(error)")`. A
 - **Comments:** Liberal explanatory comments on non-obvious logic, especially around sync, audio, mail composer wrappers, and store-scoping edge cases. Match the existing tone — explain *why*, not *what*.
 - **Edits:** Prefer surgical `str_replace` edits over full-file rewrites. Re-read the file region before editing — it's long and easy to make wrong assumptions.
 - **Brace balance:** After any non-trivial edit, verify braces balance. Use the helper command `/balance-check` (see `.claude/commands/`) or run the inline Python script in `scripts/balance.py`.
-- **Imports at the top:** `SwiftUI, SwiftData, AudioToolbox, AVFoundation, BackgroundTasks, VisionKit, Vision, MessageUI`. Add new imports here, not inline.
+- **Imports at the top:** `SwiftUI, SwiftData, AudioToolbox, AVFoundation, BackgroundTasks, VisionKit, Vision, MessageUI, CloudKit`. Add new imports here, not inline.
 - **No new dependencies without asking:** No SPM packages, no CocoaPods. The point of single-file is no third-party surface area.
 - **Error display:** Red errors auto-dismiss after 4s in the scan screen via `scanErrorBanner(message:)`.
 
@@ -66,6 +66,18 @@ Container init currently uses `fatalError("ModelContainer failed: \(error)")`. A
 - Don't add `Done` button in keyboard toolbar — it overlapped the Submit button at small sizes.
 - `dismiss-keyboard-on-outside-tap` was blocking swipe-to-delete handles. We use `scrollDismissesKeyboard(.immediately)` only.
 
+## CloudKit team sync (public database)
+
+Submitted sessions are pushed to `CKContainer("iCloud.com.jacent.BackstockTracker").publicCloudDatabase`, record type `BackstockSession`. The HistoryView segmented control flips between "Mine" (local SwiftData) and "Team" (CloudKit fetch). Records are anonymous by design — no submitter identity, just store / store# / box / items / totals / submittedAt. Area is stored on the record and used to scope the team feed.
+
+**Required before production TestFlight:**
+- Enable iCloud capability in Xcode (Signing & Capabilities → + Capability → iCloud → CloudKit → container `iCloud.com.jacent.BackstockTracker`)
+- First app run auto-generates the Development schema on first save
+- In the CloudKit Dashboard: make `submittedAt` **Sortable** and `area` **Queryable** (both under Schema → Indexes) before deploying to Production
+- Deploy Schema to Production before App Store release
+
+**Retry on launch:** `CloudSyncService.retryPending` sweeps for local sessions with `cloudSyncedAt == nil` and uploads them, so a network blip at submit time doesn't drop records from the team feed.
+
 ## Outstanding work
 
 - [ ] Info.plist: `NSCameraUsageDescription` (required for App Store / TestFlight)
@@ -73,5 +85,5 @@ Container init currently uses `fatalError("ModelContainer failed: \(error)")`. A
 - [ ] Replace `fatalError` with `VersionedSchema` migration before any external user has prod data
 - [ ] HistoryView filter chips (All / Submitted / Over limit)
 - [ ] "Signed-in AM removed from roster" edge case
-- [ ] Central upload of submitted sessions (SharePoint list / Power Automate)
+- [ ] Enable CloudKit capability in Xcode + deploy schema to production before TestFlight release
 - [ ] Android port — same Drive sources, same data contract
