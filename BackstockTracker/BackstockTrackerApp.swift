@@ -35,6 +35,70 @@ import Vision
 import MessageUI
 import CloudKit
 
+// MARK: - Theme
+
+// Jacent-branded color palette. Applied app-wide via .tint() on the
+// root view (LaunchCoordinator), so every Button / NavigationLink /
+// progress indicator picks up the muted teal automatically. Errors,
+// warnings, and success states stay on their semantic system colors
+// (red / orange / green) — those carry meaning and shouldn't be
+// re-tinted.
+//
+// Hex values mirror the Jacent marketing materials:
+//   • teal    — primary brand surface ("jacent" logo background)
+//   • yellow  — secondary accent (the "Retail made easier." tagline)
+//   • cream   — soft light surface for tinted headers
+//   • ink     — warm dark for emphasis text
+extension Color {
+    // Primary brand tint — muted teal/sea-green. Adaptive: a touch
+    // brighter on dark so it carries the same energy against a
+    // black-ish background.
+    static let jacentTeal = Color(
+        light: Color(red: 0x4A / 255, green: 0x9B / 255, blue: 0x97 / 255),
+        dark:  Color(red: 0x5F / 255, green: 0xB5 / 255, blue: 0xB1 / 255)
+    )
+
+    // Secondary brand accent — warm sun yellow. Used for highlights
+    // (over-limit chips, "draft saved" toast accent stripe, etc.)
+    // rather than primary actions. We don't override .tint with it
+    // because two competing tints in toolbars look chaotic.
+    static let jacentYellow = Color(
+        light: Color(red: 0xF0 / 255, green: 0xC2 / 255, blue: 0x4A / 255),
+        dark:  Color(red: 0xF6 / 255, green: 0xCE / 255, blue: 0x66 / 255)
+    )
+
+    // Soft cream surface, slightly desaturated from pure white. Use
+    // sparingly — tinted headers, picker chrome, etc. Most of the
+    // app continues to use the system grouped backgrounds for
+    // accessibility/contrast reasons.
+    static let jacentCream = Color(
+        light: Color(red: 0xF6 / 255, green: 0xF3 / 255, blue: 0xEC / 255),
+        dark:  Color(red: 0x1F / 255, green: 0x26 / 255, blue: 0x26 / 255)
+    )
+
+    // Warm dark used for emphatic foreground text on tinted surfaces
+    // where pure `.primary` reads too cold against the teal/cream.
+    static let jacentInk = Color(
+        light: Color(red: 0x1E / 255, green: 0x33 / 255, blue: 0x33 / 255),
+        dark:  Color(red: 0xEC / 255, green: 0xF1 / 255, blue: 0xEF / 255)
+    )
+
+    // Convenience alias kept around so call sites can refer to
+    // "the brand tint" without naming a specific hue — if Jacent
+    // ever rebrands, only this extension changes.
+    static var brandAccent: Color { jacentTeal }
+
+    // Helper init that picks between light/dark variants without
+    // requiring an asset catalog. Wraps UIColor's dynamic provider.
+    init(light: Color, dark: Color) {
+        self = Color(UIColor { trait in
+            trait.userInterfaceStyle == .dark
+                ? UIColor(dark)
+                : UIColor(light)
+        })
+    }
+}
+
 // MARK: - App entry
 
 @main
@@ -180,6 +244,10 @@ struct BackstockTrackerApp: App {
         WindowGroup {
             LaunchCoordinator()
                 .environment(ScanSessionStore())
+                // Jacent-branded accent applied at the root so it
+                // cascades through every NavigationStack, Button,
+                // toolbar item, and progress indicator in the app.
+                .tint(.jacentTeal)
                 .task {
                     // Prime the audio service so its session config runs
                     // during launch, not on first scan.
