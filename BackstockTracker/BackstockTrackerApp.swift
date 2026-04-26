@@ -4754,15 +4754,11 @@ struct StoreHistoryRow: View {
                     .monospacedDigit()
                 Spacer()
                 if let box = record.box {
-                    // Jacent yellow / ink — kept in sync with the
-                    // Box chip on the flat contents list so the
-                    // same physical box reads the same way wherever
-                    // it appears.
                     Text("Box \(box)")
-                        .font(.caption2).fontWeight(.semibold)
-                        .foregroundStyle(Color.jacentInk)
+                        .font(.caption2).fontWeight(.medium)
+                        .foregroundStyle(Color.accentColor)
                         .padding(.horizontal, 6).padding(.vertical, 1)
-                        .background(Color.jacentYellow)
+                        .background(Color.accentColor.opacity(0.14))
                         .clipShape(Capsule())
                 }
             }
@@ -6241,18 +6237,15 @@ struct AllBackstockDetailView: View {
                 // Same accent treatment as the History row's Box
                 // chip for visual consistency.
                 if let box = flat.box {
-                    // Jacent yellow / ink — the box # is the
-                    // primary "where do I find this" anchor when
-                    // an AM is scanning down the contents list,
-                    // so it gets the brand-secondary highlight
-                    // instead of the same teal as everything else.
-                    // jacentInk reads softer than pure black while
-                    // still clearing AA contrast on the yellow.
+                    // Box # chip — leading edge of line 2 so it's the
+                    // first thing the eye picks up when scanning down.
+                    // Same accent treatment as the History row's Box
+                    // chip for visual consistency.
                     Text("Box \(box)")
                         .font(.caption2).fontWeight(.semibold)
-                        .foregroundStyle(Color.jacentInk)
+                        .foregroundStyle(Color.accentColor)
                         .padding(.horizontal, 6).padding(.vertical, 1)
-                        .background(Color.jacentYellow)
+                        .background(Color.accentColor.opacity(0.14))
                         .clipShape(Capsule())
                 }
                 if let commodity = item.commodity, !commodity.isEmpty {
