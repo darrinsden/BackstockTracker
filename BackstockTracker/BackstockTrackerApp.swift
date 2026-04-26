@@ -4754,13 +4754,13 @@ struct StoreHistoryRow: View {
                     .monospacedDigit()
                 Spacer()
                 if let box = record.box {
-                    // Jacent yellow / black — kept in sync with
-                    // the Box chip on the flat contents list so
-                    // the same physical box reads the same way
-                    // wherever it appears.
+                    // Jacent yellow / ink — kept in sync with the
+                    // Box chip on the flat contents list so the
+                    // same physical box reads the same way wherever
+                    // it appears.
                     Text("Box \(box)")
                         .font(.caption2).fontWeight(.semibold)
-                        .foregroundStyle(Color.black)
+                        .foregroundStyle(Color.jacentInk)
                         .padding(.horizontal, 6).padding(.vertical, 1)
                         .background(Color.jacentYellow)
                         .clipShape(Capsule())
@@ -6241,14 +6241,16 @@ struct AllBackstockDetailView: View {
                 // Same accent treatment as the History row's Box
                 // chip for visual consistency.
                 if let box = flat.box {
-                    // Jacent yellow / black — the box # is the
+                    // Jacent yellow / ink — the box # is the
                     // primary "where do I find this" anchor when
                     // an AM is scanning down the contents list,
                     // so it gets the brand-secondary highlight
                     // instead of the same teal as everything else.
+                    // jacentInk reads softer than pure black while
+                    // still clearing AA contrast on the yellow.
                     Text("Box \(box)")
                         .font(.caption2).fontWeight(.semibold)
-                        .foregroundStyle(Color.black)
+                        .foregroundStyle(Color.jacentInk)
                         .padding(.horizontal, 6).padding(.vertical, 1)
                         .background(Color.jacentYellow)
                         .clipShape(Capsule())
