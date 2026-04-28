@@ -5983,15 +5983,26 @@ struct AllBackstockDetailView: View {
     // UPC, name, and commodity (OR-ed), so typing a UPC narrows by
     // UPC, typing "shopping bag" narrows by name, and typing "TOYS"
     // narrows by commodity — all in one field.
+    //
+    // The UPC branch strips leading zeros from BOTH sides before
+    // comparing — the scanner often returns 13-digit codes
+    // (`0637118500117`) for items the catalog stores as 12-digit
+    // UPC-A (`637118500117`). Without this normalization, a scan
+    // that should hit returns "0 of N" because the literal substring
+    // doesn't match. Mirrors the candidate-ladder logic in
+    // CatalogService.upcCandidates.
     private func displayedItems() -> [FlatItem] {
         var filtered = allItems
         let q = trimmedSearch.lowercased()
         if !q.isEmpty {
+            let qUPC = Self.stripLeadingZeros(q)
             filtered = filtered.filter { flat in
-                let upc       = flat.item.upc.lowercased()
-                let name      = flat.item.name.lowercased()
+                let itemUPC = Self.stripLeadingZeros(flat.item.upc.lowercased())
+                let name = flat.item.name.lowercased()
                 let commodity = (flat.item.commodity ?? "").lowercased()
-                return upc.contains(q) || name.contains(q) || commodity.contains(q)
+                return itemUPC.contains(qUPC)
+                    || name.contains(q)
+                    || commodity.contains(q)
             }
         }
         switch sortOrder {
@@ -6014,6 +6025,17 @@ struct AllBackstockDetailView: View {
             return short
         }
         return ""
+    }
+
+    /// Drop a single leading "0" if the string is purely digits. Used
+    /// to normalize UPCs for substring search so the 12-vs-13-digit
+    /// inconsistency between scanners and catalog rows doesn't drop
+    /// otherwise-valid matches. Non-digit strings pass through
+    /// unchanged so name / commodity searches aren't disturbed.
+    private static func stripLeadingZeros(_ s: String) -> String {
+        guard !s.isEmpty, s.allSatisfy({ $0.isNumber }) else { return s }
+        let stripped = String(s.drop(while: { $0 == "0" }))
+        return stripped.isEmpty ? s : stripped
     }
 
     var body: some View {
