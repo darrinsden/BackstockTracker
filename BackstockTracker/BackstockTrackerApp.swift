@@ -2740,8 +2740,10 @@ private enum ScanSortOrder: String, CaseIterable {
     case scanOrder = "Scan order"
     case nameAZ    = "Name A→Z"
     case nameZA    = "Name Z→A"
-    case priceHigh = "Price: High–Low"
-    case priceLow  = "Price: Low–High"
+    // Price sorts removed by request — they didn't map to any AM
+    // workflow on the backstock surfaces (rank already conveys the
+    // useful "what should I work first" signal). Re-add scoped to a
+    // specific view if a use case shows up.
 }
 
 private enum ScanFilterMode: String, CaseIterable {
@@ -5269,10 +5271,6 @@ struct TeamSessionDetailView: View {
             return filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         case .nameZA:
             return filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedDescending }
-        case .priceHigh:
-            return filtered.sorted { $0.price > $1.price }
-        case .priceLow:
-            return filtered.sorted { $0.price < $1.price }
         }
     }
 
@@ -6044,10 +6042,6 @@ struct AllBackstockDetailView: View {
             return filtered.sorted { $0.item.name.localizedCaseInsensitiveCompare($1.item.name) == .orderedAscending }
         case .nameZA:
             return filtered.sorted { $0.item.name.localizedCaseInsensitiveCompare($1.item.name) == .orderedDescending }
-        case .priceHigh:
-            return filtered.sorted { $0.item.price > $1.item.price }
-        case .priceLow:
-            return filtered.sorted { $0.item.price < $1.item.price }
         }
     }
 
@@ -6817,8 +6811,6 @@ struct SessionDetailView: View {
         case .scanOrder:  return filtered
         case .nameAZ:     return filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         case .nameZA:     return filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedDescending }
-        case .priceHigh:  return filtered.sorted { $0.price > $1.price }
-        case .priceLow:   return filtered.sorted { $0.price < $1.price }
         }
     }
 
