@@ -4191,17 +4191,11 @@ struct StoreHistoryList: View {
     // Drives the "View all backstock" navigation push from the
     // header button into AllBackstockDetailView. The export menu
     // (CSV / Print / Email) lives on that pushed screen now, not
-    // here — keeps this list focused on per-box browsing.
+    // here — keeps this list focused on per-box browsing. The
+    // find-an-item search + barcode-scan affordance also lives on
+    // that screen now (the "Backstock contents" page), where the
+    // flat line-items list is the natural place to filter by UPC.
     @State private var showAllBackstock = false
-
-    // Find-an-item state. The AM types or scans into the same
-    // searchText — the camera path just pre-fills it from the
-    // detected UPC and dismisses. Substring match runs against UPC,
-    // item name, and commodity. While searchText is non-empty the
-    // box list is replaced by a flat results list so the AM can see
-    // every box that contains a hit at once.
-    @State private var searchText: String = ""
-    @State private var showScanner: Bool = false
 
     // Drives the "Remove all empty boxes" confirmation dialog. An
     // empty box is a CloudKit record with `items.isEmpty` — usually
@@ -4222,11 +4216,6 @@ struct StoreHistoryList: View {
     }
 
     enum LoadState { case loading, loaded, failed }
-
-    private var isLoaded: Bool {
-        if case .loaded = loadState { return true }
-        return false
-    }
 
     // Records narrowed to the AM's currently-scoped store. We always
     // fetch the area-wide feed, then filter here, rather than issuing
@@ -4261,53 +4250,6 @@ struct StoreHistoryList: View {
     // cleanup affordance is for.
     private var emptyBoxes: [TeamBackstockRecord] {
         sortedRecords.filter { $0.items.isEmpty }
-    }
-
-    // One match per (record, item) pair. The same UPC living in two
-    // boxes shows up as two hits — that's the point of the feature
-    // ("which boxes have this thing"). Stable id includes box so a
-    // SwiftUI ForEach doesn't fold duplicates.
-    struct SearchHit: Identifiable, Hashable {
-        let record: TeamBackstockRecord
-        let item: CloudSyncItem
-        var id: String { "\(record.id):\(item.upc):\(record.box ?? -1)" }
-    }
-
-    private var trimmedSearch: String {
-        searchText.trimmingCharacters(in: .whitespaces)
-    }
-
-    private var isSearching: Bool { !trimmedSearch.isEmpty }
-
-    // Substring match against UPC, name, and commodity. Lowercased
-    // both sides so name searches are case-insensitive. UPC is a
-    // substring match too — handles the 12-vs-13-digit inconsistency
-    // (typing "63411" matches both "0634118…" and "634118…") without
-    // needing a normalization ladder here. Sorted by box ascending so
-    // results read in the same aisle-walk order as the box list.
-    private var searchHits: [SearchHit] {
-        guard isSearching else { return [] }
-        let q = trimmedSearch.lowercased()
-        var hits: [SearchHit] = []
-        for record in sortedRecords {
-            for item in record.items {
-                let upcMatch       = item.upc.lowercased().contains(q)
-                let nameMatch      = item.name.lowercased().contains(q)
-                let commodityMatch = (item.commodity ?? "").lowercased().contains(q)
-                if upcMatch || nameMatch || commodityMatch {
-                    hits.append(SearchHit(record: record, item: item))
-                }
-            }
-        }
-        return hits.sorted { lhs, rhs in
-            switch (lhs.record.box, rhs.record.box) {
-            case let (l?, r?) where l != r: return l < r
-            case (_?, nil): return true
-            case (nil, _?): return false
-            default:
-                return lhs.record.submittedAt > rhs.record.submittedAt
-            }
-        }
     }
 
     var body: some View {
@@ -4346,31 +4288,13 @@ struct StoreHistoryList: View {
                 }
             }
 
-            // Find-an-item bar. AM types a UPC, name, or commodity
-            // — or taps the camera button to scan — and the box list
-            // below flips to a flat results list of every line item
-            // matching the query, across every box. Shown above the
-            // empty-box cleanup button so the most-actionable
-            // affordance is closest to the header.
-            //
-            // Hidden in loading / failed / empty states so we don't
-            // suggest the AM can find something in an empty list.
-            if isLoaded && !sortedRecords.isEmpty {
-                searchBar
-                    .overlay(alignment: .bottom) { Divider() }
-            }
-
             // "Remove all empty boxes" — only visible when there's
             // actually something to clean up. Styled as a destructive
             // peer to the View all button above: same row chrome,
             // red foreground so it doesn't read as a routine action,
             // no chevron (it's not a navigation push). Routes through
             // a confirmationDialog before issuing any deletes.
-            //
-            // Suppressed during an active search — the cleanup
-            // affordance is about list-wide hygiene, which doesn't
-            // apply to the find-an-item flow the AM is in.
-            if !emptyBoxes.isEmpty && !isSearching {
+            if !emptyBoxes.isEmpty {
                 Button {
                     pendingEmptyBoxesCleanup = true
                 } label: {
@@ -4432,8 +4356,6 @@ struct StoreHistoryList: View {
                             .padding(.horizontal)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if isSearching {
-                    searchResultsList
                 } else {
                     List {
                         ForEach(sortedRecords) { record in
@@ -4476,17 +4398,6 @@ struct StoreHistoryList: View {
                     .refreshable { await reload() }
                 }
                 }
-            }
-        }
-        .fullScreenCover(isPresented: $showScanner) {
-            // Reuse the same camera scanner the scan flow uses. We
-            // ignore the catalog-driven feedback (this is a backstock
-            // search, not a catalog lookup) — every scan returns
-            // .added, populates the search field, and dismisses.
-            CameraScannerView(notFoundUPC: nil, notFoundReason: nil) { upc in
-                searchText = upc
-                showScanner = false
-                return .added
             }
         }
         // "View all items" navigation. Pushes AllBackstockDetailView
@@ -4642,85 +4553,6 @@ struct StoreHistoryList: View {
         return "Box (\(record.submittedAt.formatted(date: .abbreviated, time: .omitted)))"
     }
 
-    // MARK: - Search subviews
-
-    // Find-an-item bar. Mirrors the chrome of the "View all backstock"
-    // and "Remove empty boxes" rows above it (same tinted background,
-    // same horizontal/vertical padding) so the three header rows read
-    // as one cohesive band. The barcode-scan button sits to the right
-    // of the field — same icon as ScanView's launcher so AMs recognize
-    // it. Tapping it fires `showScanner`, which presents the same
-    // CameraScannerView that the scan flow uses (just with a different
-    // onScan handler that pre-fills searchText instead of submitting).
-    private var searchBar: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-            TextField("Search by UPC, name, or commodity",
-                      text: $searchText)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .submitLabel(.search)
-            if !searchText.isEmpty {
-                Button {
-                    searchText = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-            Button {
-                showScanner = true
-            } label: {
-                Image(systemName: "barcode.viewfinder")
-                    .font(.title3)
-                    .foregroundStyle(.tint)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Scan a barcode")
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(Color(.secondarySystemGroupedBackground))
-    }
-
-    // Flat list of every (record, item) match for the active query.
-    // Pull-to-refresh stays wired so an AM mid-search can pick up
-    // freshly-submitted boxes from a teammate without exiting search.
-    @ViewBuilder
-    private var searchResultsList: some View {
-        let hits = searchHits
-        if hits.isEmpty {
-            VStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 36))
-                    .foregroundStyle(.secondary)
-                Text("No matches")
-                    .font(.headline)
-                Text("No item in this store's backstock matches “\(trimmedSearch)”.")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            List {
-                Section {
-                    ForEach(hits) { hit in
-                        NavigationLink(value: hit.record) {
-                            SearchHitRow(hit: hit)
-                        }
-                    }
-                } header: {
-                    Text("\(hits.count) match\(hits.count == 1 ? "" : "es")")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            .listStyle(.insetGrouped)
-            .refreshable { await reload() }
-        }
-    }
 
     @MainActor
     private func reload() async {
@@ -5080,69 +4912,6 @@ struct StoreHistoryRow: View {
     }
 }
 
-// One row per search hit: name + Box chip + UPC + qty/price. Tapping
-// pushes the matched box's TeamSessionDetailView, where the AM can
-// see the rest of that box's contents and (if needed) edit the line.
-struct SearchHitRow: View {
-    let hit: StoreHistoryList.SearchHit
-
-    var body: some View {
-        let item = hit.item
-        let lineTotal = item.price * Double(item.quantity)
-        return VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(item.name)
-                    .font(.subheadline).fontWeight(.semibold)
-                    .lineLimit(2)
-                Spacer(minLength: 4)
-                if let box = hit.record.box {
-                    // Same Box chip language as StoreHistoryRow so the
-                    // physical-box anchor reads identically across the
-                    // box list and the search-results list.
-                    Text("Box \(box)")
-                        .font(.caption2).fontWeight(.medium)
-                        .foregroundStyle(Color.accentColor)
-                        .padding(.horizontal, 6).padding(.vertical, 1)
-                        .background(Color.accentColor.opacity(0.14))
-                        .clipShape(Capsule())
-                }
-            }
-            HStack(spacing: 6) {
-                Text(item.upc)
-                    .font(.caption2).monospaced()
-                    .foregroundStyle(.tertiary)
-                if let commodity = item.commodity, !commodity.isEmpty {
-                    Text("·").font(.caption2).foregroundStyle(.tertiary)
-                    Text(commodity)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if item.quantity > 1 {
-                    Text("× \(item.quantity)")
-                        .font(.caption).fontWeight(.semibold)
-                        .monospacedDigit()
-                        .foregroundStyle(Color.accentColor)
-                        .padding(.horizontal, 6).padding(.vertical, 1)
-                        .background(Color.accentColor.opacity(0.14))
-                        .clipShape(Capsule())
-                }
-                Text(currency(lineTotal))
-                    .font(.caption).fontWeight(.medium)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
-        }
-        .padding(.vertical, 4)
-    }
-
-    private func currency(_ value: Double) -> String {
-        let f = NumberFormatter()
-        f.numberStyle = .currency
-        f.locale = Locale(identifier: "en_US")
-        return f.string(from: NSNumber(value: value)) ?? "$\(value)"
-    }
-}
 
 struct HistoryRow: View {
     let session: ScanSession
@@ -6146,13 +5915,15 @@ struct AllBackstockDetailView: View {
     let storeNumber: String
 
     @State private var sortOrder: ScanSortOrder = .rank
-    @State private var commoditySearch: String = ""
-    // Name filter runs in parallel with the commodity filter — both
-    // are AND-ed in `displayedItems`. Splitting them gives the AM a
-    // way to narrow on "shopping bag" without scrolling through every
-    // commodity, while still combining filters when useful (e.g.
-    // commodity = TOYS and name contains "punch").
-    @State private var nameSearch: String = ""
+    // Unified find-an-item search. Substring match across UPC, item
+    // name, and commodity in one field — replaces the previous
+    // commodity / name pair. Single field is enough because almost
+    // every "where is X?" query is naturally one of those three, and
+    // the AM doesn't have to think about which box to type into.
+    // Pre-fillable from a barcode scan via the toolbar scan button
+    // (see showScanner / fullScreenCover below).
+    @State private var searchText: String = ""
+    @State private var showScanner: Bool = false
 
     // Export-all sheets. Shared CSV-on-disk goes through ShareURL
     // (Quick Look / share sheet), and the email path uses the same
@@ -6197,25 +5968,31 @@ struct AllBackstockDetailView: View {
         records.reduce(0) { $0 + $1.items.count }
     }
 
-    private var isFiltered: Bool {
-        sortOrder != .rank || !commoditySearch.isEmpty || !nameSearch.isEmpty
+    private var trimmedSearch: String {
+        searchText.trimmingCharacters(in: .whitespaces)
     }
 
-    // Mirrors TeamSessionDetailView.displayedItems — same sort modes,
-    // same commodity-substring filter — so AMs jumping between the
-    // two views see consistent behavior. .scanOrder here means
-    // "natural" (box-asc, then within-box order). Name + commodity
-    // filters AND together: an item must match both (when both are
-    // non-empty) to survive the cut.
+    private var isFiltered: Bool {
+        sortOrder != .rank || !trimmedSearch.isEmpty
+    }
+
+    // Mirrors TeamSessionDetailView.displayedItems — same sort modes —
+    // so AMs jumping between the two views see consistent behavior.
+    // .scanOrder here means "natural" (box-asc, then within-box
+    // order). The search field runs a single substring match across
+    // UPC, name, and commodity (OR-ed), so typing a UPC narrows by
+    // UPC, typing "shopping bag" narrows by name, and typing "TOYS"
+    // narrows by commodity — all in one field.
     private func displayedItems() -> [FlatItem] {
         var filtered = allItems
-        if !commoditySearch.isEmpty {
-            let q = commoditySearch.lowercased()
-            filtered = filtered.filter { ($0.item.commodity ?? "").lowercased().contains(q) }
-        }
-        if !nameSearch.isEmpty {
-            let q = nameSearch.lowercased()
-            filtered = filtered.filter { $0.item.name.lowercased().contains(q) }
+        let q = trimmedSearch.lowercased()
+        if !q.isEmpty {
+            filtered = filtered.filter { flat in
+                let upc       = flat.item.upc.lowercased()
+                let name      = flat.item.name.lowercased()
+                let commodity = (flat.item.commodity ?? "").lowercased()
+                return upc.contains(q) || name.contains(q) || commodity.contains(q)
+            }
         }
         switch sortOrder {
         case .rank:
@@ -6255,8 +6032,8 @@ struct AllBackstockDetailView: View {
             // Sort menu (leading): mirrors TeamSessionDetailView /
             // SessionDetailView. No Filter section — neither
             // CloudSyncItem nor the flattened FlatItem carries a
-            // manual-override flag, so the only meaningful filters here
-            // are the commodity + name search fields below.
+            // manual-override flag, so the only meaningful filter here
+            // is the unified search field below the header.
             ToolbarItem(placement: .navigationBarLeading) {
                 Menu {
                     Section("Sort") {
@@ -6298,6 +6075,18 @@ struct AllBackstockDetailView: View {
         .fullScreenCover(item: $mailPayload) { payload in
             TeamMailComposerView(payload: payload)
                 .ignoresSafeArea()
+        }
+        // Barcode-scan path for the unified search field. We don't
+        // care about catalog feedback here (this is a backstock find,
+        // not a fresh scan) — every detection just pre-fills the
+        // search field and dismisses, returning .added to signal the
+        // detection was consumed.
+        .fullScreenCover(isPresented: $showScanner) {
+            CameraScannerView(notFoundUPC: nil, notFoundReason: nil) { upc in
+                searchText = upc
+                showScanner = false
+                return .added
+            }
         }
     }
 
@@ -6541,56 +6330,39 @@ struct AllBackstockDetailView: View {
             .padding(.top, 20)
             .padding(.bottom, 4)
 
-            // Commodity search — same accent strip as the box-contents
-            // page so the two screens read as a series.
-            HStack(spacing: 8) {
-                Image(systemName: "tag")
-                    .foregroundStyle(Color.accentColor)
-                    .font(.caption)
-                TextField("Filter by commodity", text: $commoditySearch)
-                    .font(.subheadline)
-                    .autocorrectionDisabled()
-                if !commoditySearch.isEmpty {
-                    Button {
-                        commoditySearch = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 10)
-            .frame(maxWidth: .infinity)
-            .background(Color.accentColor.opacity(0.08))
-            .overlay(alignment: .top) {
-                Rectangle()
-                    .fill(Color.accentColor.opacity(0.30))
-                    .frame(height: 0.5)
-            }
-
-            // Name search — stacked directly under the commodity
-            // strip with a thin accent hairline between them so the
-            // two read as a paired filter group rather than separate
-            // sections. Both are case-insensitive substring matches
-            // and AND-ed in displayedItems().
+            // Unified find-an-item bar — substring-matches the typed
+            // text against UPC, name, AND commodity in one shot. The
+            // trailing barcode button opens the same CameraScannerView
+            // the scan flow uses; on a successful detection the UPC
+            // pre-fills `searchText` and the scanner dismisses, so the
+            // AM lands back here with the list already narrowed.
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(Color.accentColor)
                     .font(.caption)
-                TextField("Filter by name", text: $nameSearch)
+                TextField("Search by UPC, name, or commodity", text: $searchText)
                     .font(.subheadline)
+                    .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                if !nameSearch.isEmpty {
+                    .submitLabel(.search)
+                if !searchText.isEmpty {
                     Button {
-                        nameSearch = ""
+                        searchText = ""
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
                 }
+                Button {
+                    showScanner = true
+                } label: {
+                    Image(systemName: "barcode.viewfinder")
+                        .font(.title3)
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Scan a barcode")
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 10)
