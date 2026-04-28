@@ -5652,6 +5652,11 @@ struct TeamSessionDetailView: View {
         func esc(_ s: String) -> String {
             "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\""
         }
+        // Two-decimal format keeps prices as proper currency in Excel /
+        // Numbers — bare Double interpolation drops trailing zeros, so
+        // 4.00 ends up rendered as "4" and breaks the column's numeric
+        // alignment (and the AM's expectation of cents).
+        func money(_ v: Double) -> String { String(format: "%.2f", v) }
         for (idx, item) in sorted.enumerated() {
             let lineTotal = item.price * Double(item.quantity)
             lines.append([
@@ -5659,8 +5664,8 @@ struct TeamSessionDetailView: View {
                 esc(item.name),
                 item.upc,
                 "\(item.quantity)",
-                "\(item.price)",
-                "\(lineTotal)",
+                money(item.price),
+                money(lineTotal),
                 esc(item.commodity ?? ""),
                 item.rank.map(String.init) ?? ""
             ].joined(separator: ","))
@@ -6017,6 +6022,9 @@ struct AllBackstockDetailView: View {
         func esc(_ s: String) -> String {
             "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\""
         }
+        // Force two decimals so 4.00 renders as "4.00" (not "4") in
+        // Excel / Numbers. Same fix mirrored in the per-box CSV.
+        func money(_ v: Double) -> String { String(format: "%.2f", v) }
         for record in records {
             let boxText = record.box.map { "Box \($0)" } ?? "Unboxed"
             let submitted = record.submittedAt.formatted(date: .abbreviated, time: .shortened)
@@ -6029,8 +6037,8 @@ struct AllBackstockDetailView: View {
                     esc(item.name),
                     item.upc,
                     "\(item.quantity)",
-                    "\(item.price)",
-                    "\(lineTotal)",
+                    money(item.price),
+                    money(lineTotal),
                     esc(item.commodity ?? ""),
                     item.rank.map(String.init) ?? ""
                 ].joined(separator: ","))
@@ -7055,6 +7063,20 @@ struct SessionDetailView: View {
     private func csvURL(for session: ScanSession) -> URL? {
         let sorted = session.items.sorted { $0.scannedAt < $1.scannedAt }
         var lines = ["#,Name,UPC,Qty,Unit Price,Line Total,Manual,Note"]
+        // ScannedItem stores price as Decimal — format directly with
+        // NSDecimalNumber so we don't lose precision through a Double
+        // round-trip on the way to "%.2f".
+        let priceFmt: NumberFormatter = {
+            let f = NumberFormatter()
+            f.numberStyle = .decimal
+            f.minimumFractionDigits = 2
+            f.maximumFractionDigits = 2
+            f.usesGroupingSeparator = false   // CSV: no thousands commas
+            return f
+        }()
+        func money(_ d: Decimal) -> String {
+            priceFmt.string(from: NSDecimalNumber(decimal: d)) ?? "0.00"
+        }
         for (idx, item) in sorted.enumerated() {
             func esc(_ s: String) -> String { "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\"" }
             lines.append([
@@ -7062,8 +7084,8 @@ struct SessionDetailView: View {
                 esc(item.name),
                 item.upc,
                 "\(item.quantity)",
-                "\(item.price)",
-                "\(item.lineTotal)",
+                money(item.price),
+                money(item.lineTotal),
                 item.manualOverride ? "yes" : "no",
                 esc(item.overrideNote ?? "")
             ].joined(separator: ","))
