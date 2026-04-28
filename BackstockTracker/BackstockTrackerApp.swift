@@ -1295,19 +1295,18 @@ final class ScanSessionStore {
         // and if the user manually added one earlier, re-scanning it
         // should still increment rather than duplicate.
         //
-        // Whether the item is brand-new or a re-add, the touched line
-        // ends up at index 0. The most recently touched item should
-        // be the most visible — this is true equally for scans,
-        // re-scans, and manual entries, so the rule is uniform: every
-        // add() lands at the top.
+        // The scan list renders `store.items.reversed()` (see
+        // ScanView.itemsList), so the *last* element of this array is
+        // the visual top of the list. To make every touched item
+        // (scan, re-scan, manual entry) appear at the top, we
+        // append. For re-adds, that means removing the existing line
+        // and re-appending the bumped copy.
         if let idx = items.firstIndex(where: { $0.upc == item.upc }) {
-            items[idx].quantity += item.quantity
-            if idx != 0 {
-                let bumped = items.remove(at: idx)
-                items.insert(bumped, at: 0)
-            }
+            var bumped = items.remove(at: idx)
+            bumped.quantity += item.quantity
+            items.append(bumped)
         } else {
-            items.insert(item, at: 0)
+            items.append(item)
         }
         AudioService.shared.playScanConfirm()
     }
