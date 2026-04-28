@@ -5117,6 +5117,32 @@ struct TeamSessionDetailView: View {
         .navigationTitle(navTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            // Sort menu (leading): mirrors SessionDetailView so AMs get
+            // the same controls on every line-items surface. We skip a
+            // Filter section here because CloudSyncItem doesn't carry
+            // the manualOverride flag — the only meaningful filter on
+            // cloud records is the commodity-search field below.
+            ToolbarItem(placement: .navigationBarLeading) {
+                Menu {
+                    Section("Sort") {
+                        ForEach(ScanSortOrder.allCases, id: \.self) { order in
+                            Button {
+                                sortOrder = order
+                            } label: {
+                                if sortOrder == order {
+                                    Label(order.rawValue, systemImage: "checkmark")
+                                } else {
+                                    Text(order.rawValue)
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: isFiltered
+                          ? "line.3.horizontal.decrease.circle.fill"
+                          : "line.3.horizontal.decrease.circle")
+                }
+            }
             // 3-dot menu on the right: Edit, Export CSV, Print, Email.
             // "Edit in Scan view" lives at the top of the menu — it's
             // the only entry that mutates the box, so we separate it
@@ -5258,7 +5284,10 @@ struct TeamSessionDetailView: View {
         let total = record.items.count
         return VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Line items (sorted by rank)")
+                // Reflect the active sort so the header is honest about
+                // what order the rows are in. Lowercased for caption-style
+                // prose ("sorted by rank", not "sorted by Rank").
+                Text("Line items (sorted by \(sortOrder.rawValue.lowercased()))")
                     .font(.caption).fontWeight(.medium)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -5868,6 +5897,32 @@ struct AllBackstockDetailView: View {
         .navigationTitle("Backstock contents")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            // Sort menu (leading): mirrors TeamSessionDetailView /
+            // SessionDetailView. No Filter section — neither
+            // CloudSyncItem nor the flattened FlatItem carries a
+            // manual-override flag, so the only meaningful filters here
+            // are the commodity + name search fields below.
+            ToolbarItem(placement: .navigationBarLeading) {
+                Menu {
+                    Section("Sort") {
+                        ForEach(ScanSortOrder.allCases, id: \.self) { order in
+                            Button {
+                                sortOrder = order
+                            } label: {
+                                if sortOrder == order {
+                                    Label(order.rawValue, systemImage: "checkmark")
+                                } else {
+                                    Text(order.rawValue)
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: isFiltered
+                          ? "line.3.horizontal.decrease.circle.fill"
+                          : "line.3.horizontal.decrease.circle")
+                }
+            }
             // Ellipsis menu: Export CSV / Print / Email — same three
             // actions that used to live on the StoreHistoryList screen,
             // moved here because the natural mental model is "I'm
@@ -6110,7 +6165,9 @@ struct AllBackstockDetailView: View {
         let total = totalLineCount
         return VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Line items (sorted by rank)")
+                // Header reflects the active sort. Mirrors
+                // TeamSessionDetailView so the two screens stay in sync.
+                Text("Line items (sorted by \(sortOrder.rawValue.lowercased()))")
                     .font(.caption).fontWeight(.medium)
                     .foregroundStyle(.secondary)
                 Spacer()
