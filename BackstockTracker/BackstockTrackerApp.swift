@@ -1294,8 +1294,18 @@ final class ScanSessionStore {
         // Matched on UPC only — a single UPC has one catalog price,
         // and if the user manually added one earlier, re-scanning it
         // should still increment rather than duplicate.
+        //
+        // After bumping, the line moves to the top of the list. The
+        // most recently touched item should be the most visible —
+        // this mirrors the new-scan-appears-where-the-eye-is feedback
+        // the AM already gets for first-time scans, and prevents the
+        // bumped quantity from disappearing offscreen on long lists.
         if let idx = items.firstIndex(where: { $0.upc == item.upc }) {
             items[idx].quantity += item.quantity
+            if idx != 0 {
+                let bumped = items.remove(at: idx)
+                items.insert(bumped, at: 0)
+            }
         } else {
             items.append(item)
         }
