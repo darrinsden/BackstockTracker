@@ -116,7 +116,25 @@ struct BackstockTrackerApp: App {
     // audit history whenever the schema drifts. Before we ship to real
     // users with real data, swap this for a VersionedSchema migration
     // plan (see "Outstanding work" in CLAUDE.md).
-    let container: ModelContainer = {
+    // Result of trying to bring up the SwiftData container. `container`
+    // is nil only in the absolute worst case where even an in-memory
+    // store couldn't be constructed — at that point we don't crash, we
+    // route the app to a recoverable error screen so the user can read
+    // what happened and act on it (delete + reinstall, or contact
+    // support) instead of seeing a hard crash.
+    let container: ModelContainer?
+    let bootError: BootError?
+
+    init() {
+        let result = Self.makeContainer()
+        self.container = result.container
+        self.bootError = result.error
+    }
+
+    /// Three-tier recovery: normal store → wipe-and-retry → in-memory.
+    /// Returns a populated container on success, or a nil container
+    /// plus a structured error the UI can present.
+    private static func makeContainer() -> (container: ModelContainer?, error: BootError?) {
         let schema = Schema([
             Product.self,
             ScanSession.self,
@@ -144,7 +162,7 @@ struct BackstockTrackerApp: App {
         print("ℹ️ SwiftData store URL: \(firstConfig.url.path)")
 
         do {
-            return try ModelContainer(for: schema, configurations: [firstConfig])
+            return (try ModelContainer(for: schema, configurations: [firstConfig]), nil)
         } catch let firstError {
             print("⚠️ ModelContainer init failed: \(firstError)")
             print("   Wiping SwiftData state and retrying (DEV RECOVERY).")
@@ -156,7 +174,7 @@ struct BackstockTrackerApp: App {
                 cloudKitDatabase: .none
             )
             do {
-                return try ModelContainer(for: schema, configurations: [retryConfig])
+                return (try ModelContainer(for: schema, configurations: [retryConfig]), nil)
             } catch let retryError {
                 print("🚨 Retry also failed: \(retryError)")
                 print("🚨 Falling back to IN-MEMORY SwiftData store — " +
@@ -168,14 +186,48 @@ struct BackstockTrackerApp: App {
                     cloudKitDatabase: .none
                 )
                 do {
-                    return try ModelContainer(for: schema, configurations: [memoryConfig])
-                } catch {
-                    fatalError("Even in-memory ModelContainer failed: \(error). " +
-                               "First error: \(firstError). Retry error: \(retryError).")
+                    return (try ModelContainer(for: schema, configurations: [memoryConfig]), nil)
+                } catch let memoryError {
+                    // We've exhausted recovery. Surface a structured
+                    // error to the UI rather than fatalError-ing out —
+                    // a clean error screen the user can read and act
+                    // on beats a hard crash with no signal.
+                    print("🛑 In-memory ModelContainer also failed: \(memoryError)")
+                    return (nil, BootError(
+                        firstError: "\(firstError)",
+                        retryError: "\(retryError)",
+                        memoryError: "\(memoryError)"
+                    ))
                 }
             }
         }
-    }()
+    }
+
+    /// Captured details from a failed three-tier container init.
+    /// Surfaced verbatim in the StorageErrorView so the user (or
+    /// support) has something to copy/paste.
+    struct BootError {
+        let firstError: String
+        let retryError: String
+        let memoryError: String
+
+        var summary: String {
+            "Backstock Tracker can't start because the local storage " +
+            "couldn't be opened — even after a recovery wipe. This is " +
+            "almost always fixed by deleting the app and reinstalling " +
+            "it from TestFlight."
+        }
+
+        var diagnosticDetails: String {
+            """
+            First attempt: \(firstError)
+
+            Retry after wipe: \(retryError)
+
+            In-memory fallback: \(memoryError)
+            """
+        }
+    }
 
     // Nukes every file under the app's Library directory that looks like
     // SwiftData / CoreData state. Much more aggressive than the previous
@@ -242,25 +294,43 @@ struct BackstockTrackerApp: App {
 
     var body: some Scene {
         WindowGroup {
-            LaunchCoordinator()
-                .environment(ScanSessionStore())
-                // Jacent-branded accent applied at the root so it
-                // cascades through every NavigationStack, Button,
-                // toolbar item, and progress indicator in the app.
+            // If the container came up cleanly, render the normal app.
+            // If not, the user gets an explanatory screen instead of a
+            // crash. We deliberately do NOT attach .modelContainer() in
+            // the error branch — there's no usable container, and the
+            // error view doesn't query SwiftData.
+            if let container, bootError == nil {
+                LaunchCoordinator()
+                    .environment(ScanSessionStore())
+                    // Jacent-branded accent applied at the root so it
+                    // cascades through every NavigationStack, Button,
+                    // toolbar item, and progress indicator in the app.
+                    .tint(.jacentTeal)
+                    .task {
+                        // Prime the audio service so its session config runs
+                        // during launch, not on first scan.
+                        _ = AudioService.shared
+                        // AM roster syncs on app launch only. The catalog
+                        // has its own schedule (foreground + BGAppRefresh).
+                        await syncAreaManagersOnLaunch(container: container)
+                    }
+                    .modelContainer(container)
+            } else {
+                StorageErrorView(error: bootError ?? BootError(
+                    firstError: "unknown",
+                    retryError: "unknown",
+                    memoryError: "container missing"
+                ))
                 .tint(.jacentTeal)
-                .task {
-                    // Prime the audio service so its session config runs
-                    // during launch, not on first scan.
-                    _ = AudioService.shared
-                    // AM roster syncs on app launch only. The catalog
-                    // has its own schedule (foreground + BGAppRefresh).
-                    await syncAreaManagersOnLaunch()
-                }
+            }
         }
-        .modelContainer(container)
     }
 
-    private func syncAreaManagersOnLaunch() async {
+    // Container is now passed in explicitly because the property is
+    // Optional — the call site has already unwrapped it via the `if let`
+    // guard in `body`, so this function works against a known-good
+    // container without re-checking.
+    private func syncAreaManagersOnLaunch(container: ModelContainer) async {
         // Run all four syncs in parallel. Roster blocks the UI
         // (LaunchCoordinator waits on it). The others run non-blocking —
         // the UI loads immediately and each table populates in the
@@ -275,11 +345,104 @@ struct BackstockTrackerApp: App {
         // iCloud-not-signed-in on submit, etc.) and retry them. Runs
         // after the catalog/stores syncs so buildPayload can find the
         // store + product rows it needs to decorate the payload.
-        let capturedContainer = container
         await CloudSyncService.retryPending(
-            container: capturedContainer,
-            catalogContext: { ModelContext(capturedContainer) }
+            container: container,
+            catalogContext: { ModelContext(container) }
         )
+    }
+}
+
+// MARK: - StorageErrorView
+//
+// Last-resort screen when the SwiftData container can't be brought up,
+// even after a recovery wipe and an in-memory fallback. This used to be
+// a fatalError(), which gave the user a hard crash and no signal. Now
+// they get something they can read and act on.
+
+struct StorageErrorView: View {
+    let error: BackstockTrackerApp.BootError
+    @State private var showDetails = false
+    @State private var copied = false
+
+    var body: some View {
+        VStack(spacing: 24) {
+            Spacer()
+
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 56))
+                .foregroundStyle(Color.jacentYellow)
+
+            VStack(spacing: 12) {
+                Text("Storage couldn't start")
+                    .font(.title2).fontWeight(.semibold)
+                    .multilineTextAlignment(.center)
+                Text(error.summary)
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 32)
+
+            VStack(spacing: 12) {
+                Button {
+                    UIPasteboard.general.string = error.diagnosticDetails
+                    copied = true
+                    // Reset the "Copied" affordance after a beat so the
+                    // user can copy again if they need to paste twice.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                        copied = false
+                    }
+                } label: {
+                    Label(copied ? "Copied" : "Copy diagnostics",
+                          systemImage: copied ? "checkmark" : "doc.on.doc")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                Button {
+                    showDetails.toggle()
+                } label: {
+                    Label(showDetails ? "Hide details" : "Show details",
+                          systemImage: showDetails
+                              ? "chevron.up"
+                              : "chevron.down")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+            }
+            .padding(.horizontal, 32)
+
+            if showDetails {
+                ScrollView {
+                    Text(error.diagnosticDetails)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .background(Color(.secondarySystemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .padding(.horizontal, 32)
+                }
+                .frame(maxHeight: 240)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
+            Spacer()
+
+            Text("After reinstalling, sign in again with your employee number — your team's submitted sessions are stored in the cloud and will reappear.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 40)
+                .padding(.bottom, 24)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.systemBackground))
+        .animation(.easeInOut(duration: 0.2), value: showDetails)
+        .animation(.easeInOut(duration: 0.2), value: copied)
     }
 }
 
