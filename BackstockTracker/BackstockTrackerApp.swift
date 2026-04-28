@@ -252,6 +252,11 @@ struct BackstockTrackerApp: App {
             if let container, bootError == nil {
                 LaunchCoordinator()
                     .environment(ScanSessionStore())
+                    // Singleton — persists across screens, tabs, and
+                    // app launches. Backstock search rows toggle
+                    // entries; the toolbar pick-list button on the
+                    // Backstock contents screen presents the sheet.
+                    .environment(PickListStore.shared)
                     // Jacent-branded accent applied at the root so it
                     // cascades through every NavigationStack, Button,
                     // toolbar item, and progress indicator in the app.
@@ -1321,6 +1326,112 @@ actor CloudSyncService {
             submittedAt: submittedAt,
             items: decoded
         )
+    }
+}
+
+// MARK: - Pick list store
+//
+// A cross-screen, cross-launch list of items the AM has flagged from
+// the backstock search results. The use case: an AM searches /
+// scans a few SKUs they need, flags each one, then carries the
+// list back to actually pull them from the boxes.
+//
+// Persists to UserDefaults as JSON so a kill-and-relaunch doesn't
+// drop the list. Keyed by (recordId, upc) so the same UPC flagged
+// from two different boxes (same SKU stocked in multiple physical
+// boxes) shows up as two distinct entries — exactly what the AM
+// wants when they're walking back to pull each one separately.
+
+struct PickListItem: Codable, Hashable, Identifiable {
+    let recordId: String       // CloudKit record id for the box
+    let upc: String
+    let name: String
+    let box: Int?
+    let storeName: String
+    let storeNumber: String
+    let quantity: Int
+    let price: Double
+    let commodity: String?
+    let addedAt: Date
+    var picked: Bool
+
+    var id: String { "\(recordId):\(upc)" }
+}
+
+@Observable
+@MainActor
+final class PickListStore {
+    static let shared = PickListStore()
+
+    private static let storageKey = "pickList.v1"
+
+    private(set) var items: [PickListItem] = []
+
+    private init() {
+        load()
+    }
+
+    /// Number of items still to pull (haven't been checked off).
+    var pendingCount: Int { items.filter { !$0.picked }.count }
+
+    /// Total flagged regardless of picked state — drives the "Clear
+    /// picked" affordance visibility.
+    var pickedCount: Int { items.filter { $0.picked }.count }
+
+    func isFlagged(recordId: String, upc: String) -> Bool {
+        items.contains(where: { $0.recordId == recordId && $0.upc == upc })
+    }
+
+    /// Add if absent, remove if present. The bookmark button on a
+    /// search result row binds to this. Newly-added items go to the
+    /// end (chronological flag order — useful when reading the list
+    /// back, since the AM remembers the order they hit each item).
+    func toggle(_ item: PickListItem) {
+        if let idx = items.firstIndex(where: { $0.id == item.id }) {
+            items.remove(at: idx)
+        } else {
+            items.append(item)
+        }
+        persist()
+    }
+
+    func setPicked(_ id: String, picked: Bool) {
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        items[idx].picked = picked
+        persist()
+    }
+
+    func remove(_ id: String) {
+        items.removeAll { $0.id == id }
+        persist()
+    }
+
+    func clearPicked() {
+        items.removeAll { $0.picked }
+        persist()
+    }
+
+    func clearAll() {
+        items.removeAll()
+        persist()
+    }
+
+    private func persist() {
+        do {
+            let data = try JSONEncoder().encode(items)
+            UserDefaults.standard.set(data, forKey: Self.storageKey)
+        } catch {
+            print("PickListStore persist failed: \(error)")
+        }
+    }
+
+    private func load() {
+        guard let data = UserDefaults.standard.data(forKey: Self.storageKey) else { return }
+        do {
+            items = try JSONDecoder().decode([PickListItem].self, from: data)
+        } catch {
+            print("PickListStore load failed: \(error)")
+        }
     }
 }
 
@@ -5935,6 +6046,12 @@ struct AllBackstockDetailView: View {
     @State private var shareItem: ShareURL?
     @State private var mailPayload: TeamMailPayload?
 
+    // Pick-list integration. The store is a singleton injected at the
+    // App entry; we read it via @Environment so changes from anywhere
+    // (the sheet, the bookmark buttons) trigger fresh row evaluations.
+    @Environment(PickListStore.self) private var pickList
+    @State private var showPickList: Bool = false
+
     // Flattened item + box info. Box is denormalized onto each row
     // because we no longer have the parent record context once the
     // list is sorted by name / price / etc. recordId is on hand for
@@ -6077,6 +6194,24 @@ struct AllBackstockDetailView: View {
                           : "line.3.horizontal.decrease.circle")
                 }
             }
+            // Pick-list toolbar entry — visible only when there's at
+            // least one flagged item. The badge text shows the
+            // count so the AM can tell at a glance how many items
+            // are queued. Tapping presents the PickListSheet, which
+            // is where the AM checks items off as they pull them.
+            if !pickList.items.isEmpty {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        showPickList = true
+                    } label: {
+                        Label("\(pickList.pendingCount)",
+                              systemImage: "bookmark.fill")
+                            .foregroundStyle(Color.jacentYellow)
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .accessibilityLabel("Open pick list (\(pickList.items.count) items)")
+                }
+            }
             // Ellipsis menu: Export CSV / Print / Email — same three
             // actions that used to live on the StoreHistoryList screen,
             // moved here because the natural mental model is "I'm
@@ -6090,6 +6225,9 @@ struct AllBackstockDetailView: View {
                     Image(systemName: "ellipsis.circle")
                 }
             }
+        }
+        .sheet(isPresented: $showPickList) {
+            PickListSheet()
         }
         .sheet(item: $shareItem) { wrap in
             TeamActivityView(items: [wrap.url])
@@ -6419,74 +6557,114 @@ struct AllBackstockDetailView: View {
     // a glance which physical box each line lives in.
     private func flatItemRow(flat: FlatItem) -> some View {
         let item = flat.item
-        return VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(item.name)
-                    .font(.subheadline).fontWeight(.semibold)
-                    .lineLimit(2)
-                Spacer(minLength: 4)
-                Text(item.upc)
-                    .monospaced()
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                if item.quantity > 1 {
-                    Text("× \(item.quantity)")
-                        .font(.caption).fontWeight(.semibold)
-                        .monospacedDigit()
-                        .foregroundStyle(Color.accentColor)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Color.accentColor.opacity(0.14))
-                        .clipShape(Capsule())
+        // Pick-list flag state for this specific (record, item) pair.
+        // Computed every render so toggles from the sheet immediately
+        // invert the row icon without a manual reload.
+        let isFlagged = pickList.isFlagged(recordId: flat.recordId, upc: item.upc)
+        return HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(item.name)
+                        .font(.subheadline).fontWeight(.semibold)
+                        .lineLimit(2)
+                    Spacer(minLength: 4)
+                    Text(item.upc)
+                        .monospaced()
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    if item.quantity > 1 {
+                        Text("× \(item.quantity)")
+                            .font(.caption).fontWeight(.semibold)
+                            .monospacedDigit()
+                            .foregroundStyle(Color.accentColor)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.accentColor.opacity(0.14))
+                            .clipShape(Capsule())
+                    }
                 }
-            }
-            HStack(spacing: 6) {
-                // Box # chip — leading edge of line 2 so it's the
-                // first thing the eye picks up when scanning down.
-                // Same accent treatment as the History row's Box
-                // chip for visual consistency.
-                if let box = flat.box {
+                HStack(spacing: 6) {
                     // Box # chip — leading edge of line 2 so it's the
                     // first thing the eye picks up when scanning down.
                     // Same accent treatment as the History row's Box
                     // chip for visual consistency.
-                    Text("Box \(box)")
-                        .font(.caption2).fontWeight(.semibold)
+                    if let box = flat.box {
+                        Text("Box \(box)")
+                            .font(.caption2).fontWeight(.semibold)
+                            .foregroundStyle(Color.accentColor)
+                            .padding(.horizontal, 6).padding(.vertical, 1)
+                            .background(Color.accentColor.opacity(0.14))
+                            .clipShape(Capsule())
+                    }
+                    if let commodity = item.commodity, !commodity.isEmpty {
+                        Text(commodity)
+                            .font(.caption2).fontWeight(.medium)
+                            .foregroundStyle(Color.accentColor)
+                            .padding(.horizontal, 6).padding(.vertical, 1)
+                            .background(Color.accentColor.opacity(0.12))
+                            .clipShape(Capsule())
+                            .lineLimit(1)
+                    }
+                    if let rank = item.rank {
+                        Text("Rank \(rank)")
+                            .font(.caption2).fontWeight(.medium)
+                            .foregroundStyle(rankColor(rank))
+                            .padding(.horizontal, 6).padding(.vertical, 1)
+                            .background(rankColor(rank).opacity(0.12))
+                            .clipShape(Capsule())
+                    }
+                    Spacer()
+                    Text(currency(item.price * Double(item.quantity)))
+                        .font(.subheadline).fontWeight(.semibold)
                         .foregroundStyle(Color.accentColor)
-                        .padding(.horizontal, 6).padding(.vertical, 1)
-                        .background(Color.accentColor.opacity(0.14))
-                        .clipShape(Capsule())
-                }
-                if let commodity = item.commodity, !commodity.isEmpty {
-                    Text(commodity)
-                        .font(.caption2).fontWeight(.medium)
-                        .foregroundStyle(Color.accentColor)
-                        .padding(.horizontal, 6).padding(.vertical, 1)
-                        .background(Color.accentColor.opacity(0.12))
-                        .clipShape(Capsule())
-                        .lineLimit(1)
-                }
-                if let rank = item.rank {
-                    Text("Rank \(rank)")
-                        .font(.caption2).fontWeight(.medium)
-                        .foregroundStyle(rankColor(rank))
-                        .padding(.horizontal, 6).padding(.vertical, 1)
-                        .background(rankColor(rank).opacity(0.12))
-                        .clipShape(Capsule())
-                }
-                Spacer()
-                Text(currency(item.price * Double(item.quantity)))
-                    .font(.subheadline).fontWeight(.semibold)
-                    .foregroundStyle(Color.accentColor)
-                    .monospacedDigit()
-                if let retail = item.retailPrice {
-                    Text("(retail \(currency(retail)))")
-                        .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                        .monospacedDigit()
+                    if let retail = item.retailPrice {
+                        Text("(retail \(currency(retail)))")
+                            .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                    }
                 }
             }
+            // Bookmark column — toggles this (record, item) on/off
+            // the pick list. Filled bookmark with Jacent yellow when
+            // flagged so the at-a-glance visual is "I added this to
+            // my pull list." Plain outline + secondary tint when not.
+            Button {
+                togglePickList(flat: flat)
+            } label: {
+                Image(systemName: isFlagged ? "bookmark.fill" : "bookmark")
+                    .font(.title3)
+                    .foregroundStyle(isFlagged ? Color.jacentYellow : Color.secondary)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isFlagged ? "Remove from pick list" : "Add to pick list")
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 10)
+    }
+
+    /// Build a PickListItem from the current FlatItem row context and
+    /// toggle it through the store. Pulls the storeName from the
+    /// owning record so the list-back-on-the-floor view can show
+    /// where each item lives even after the AM has navigated away
+    /// from the per-store screen.
+    private func togglePickList(flat: FlatItem) {
+        guard let record = records.first(where: { $0.id == flat.recordId }) else { return }
+        let entry = PickListItem(
+            recordId: record.id,
+            upc: flat.item.upc,
+            name: flat.item.name,
+            box: flat.box,
+            storeName: record.storeName,
+            storeNumber: record.storeNumber,
+            quantity: flat.item.quantity,
+            price: flat.item.price,
+            commodity: flat.item.commodity,
+            addedAt: .now,
+            picked: false
+        )
+        pickList.toggle(entry)
     }
 
     private func rankColor(_ rank: Int) -> Color {
@@ -6571,6 +6749,170 @@ extension Notification.Name {
     // AM lands back on the box they were editing — now showing the
     // saved state.
     static let openBackstockRecord = Notification.Name("openBackstockRecord")
+}
+
+// Pick-list sheet. AM-facing checklist of every item flagged from
+// search results — they leave this open while walking the floor and
+// tap a row to mark it picked. Unpicked items stay bold; picked
+// items get strikethrough + dimmed so the unpicked rows visually
+// pop. Pull-to-remove on each row (swipe). Toolbar exposes "Clear
+// picked" (when any are checked off) and "Clear all".
+struct PickListSheet: View {
+    @Environment(PickListStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+
+    // Group by box for readability — when an AM is walking from box
+    // to box they'd rather see the items grouped than scattered.
+    // Within a group we preserve insertion order (chronological flag
+    // order) so the most-recently-flagged items sort to the bottom
+    // of their box's section.
+    private var grouped: [(boxLabel: String, items: [PickListItem])] {
+        let buckets = Dictionary(grouping: store.items) { item in
+            item.box.map { "Box \($0)" } ?? "Unboxed"
+        }
+        return buckets
+            .sorted { lhs, rhs in
+                // Numeric box sort, with "Unboxed" pinned last.
+                if lhs.key == "Unboxed" { return false }
+                if rhs.key == "Unboxed" { return true }
+                let l = Int(lhs.key.replacingOccurrences(of: "Box ", with: "")) ?? .max
+                let r = Int(rhs.key.replacingOccurrences(of: "Box ", with: "")) ?? .max
+                return l < r
+            }
+            .map { (boxLabel: $0.key, items: $0.value) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if store.items.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "bookmark")
+                            .font(.system(size: 40))
+                            .foregroundStyle(.secondary)
+                        Text("No items flagged")
+                            .font(.headline)
+                        Text("Tap the bookmark on any backstock item to add it here.")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List {
+                        // Tally line at the top — pending count is what
+                        // the AM cares about while walking; total is for
+                        // context.
+                        Section {
+                            HStack {
+                                Text("\(store.pendingCount) to pull")
+                                    .font(.subheadline).fontWeight(.semibold)
+                                Spacer()
+                                if store.pickedCount > 0 {
+                                    Text("\(store.pickedCount) picked")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            .listRowBackground(Color.clear)
+                        }
+
+                        ForEach(grouped, id: \.boxLabel) { group in
+                            Section(group.boxLabel) {
+                                ForEach(group.items) { item in
+                                    pickRow(item: item)
+                                        .swipeActions(edge: .trailing) {
+                                            Button(role: .destructive) {
+                                                store.remove(item.id)
+                                            } label: {
+                                                Label("Remove", systemImage: "trash")
+                                            }
+                                        }
+                                }
+                            }
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                }
+            }
+            .navigationTitle("Pick list")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Done") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button(role: .destructive) {
+                            store.clearPicked()
+                        } label: {
+                            Label("Clear picked (\(store.pickedCount))",
+                                  systemImage: "checkmark.circle")
+                        }
+                        .disabled(store.pickedCount == 0)
+
+                        Button(role: .destructive) {
+                            store.clearAll()
+                        } label: {
+                            Label("Clear all", systemImage: "trash")
+                        }
+                        .disabled(store.items.isEmpty)
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
+            }
+        }
+    }
+
+    private func pickRow(item: PickListItem) -> some View {
+        Button {
+            store.setPicked(item.id, picked: !item.picked)
+        } label: {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: item.picked ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(item.picked ? Color.accentColor : Color.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.name)
+                        .font(.subheadline)
+                        .fontWeight(item.picked ? .regular : .semibold)
+                        .foregroundStyle(item.picked ? Color.secondary : Color.primary)
+                        .strikethrough(item.picked)
+                        .lineLimit(2)
+                    HStack(spacing: 6) {
+                        Text(item.upc)
+                            .monospaced()
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        if let commodity = item.commodity, !commodity.isEmpty {
+                            Text("·").font(.caption2).foregroundStyle(.tertiary)
+                            Text(commodity)
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if item.quantity > 1 {
+                            Text("× \(item.quantity)")
+                                .font(.caption2).fontWeight(.medium)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        Text(currency(item.price * Double(item.quantity)))
+                            .font(.caption).foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func currency(_ value: Double) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .currency
+        f.locale = Locale(identifier: "en_US")
+        return f.string(from: NSNumber(value: value)) ?? "$\(value)"
+    }
 }
 
 // Small modal sheet for editing a line-item's quantity. Opens from
