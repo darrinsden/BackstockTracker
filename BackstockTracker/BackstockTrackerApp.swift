@@ -99,6 +99,60 @@ extension Color {
     }
 }
 
+// MARK: - Schema versioning
+//
+// Every persisted @Model type belongs to a VersionedSchema. The
+// migration plan walks from the on-disk version up to the current one
+// at launch, applying any registered MigrationStages along the way.
+//
+// HOW TO ADD A V2:
+//   1. Copy `BackstockSchemaV1` to `BackstockSchemaV2`. Bump
+//      `versionIdentifier`.
+//   2. Make whatever schema change you need INSIDE V2 — adding fields,
+//      removing fields, renaming types. The compiler will tell you
+//      what else needs to move (the top-level type aliases below).
+//   3. Add a `MigrationStage` to `BackstockMigrationPlan.stages`. Use
+//      `.lightweight(fromVersion:toVersion:)` for additive changes;
+//      `.custom(...)` when you need to populate new fields from old
+//      ones, split a type, etc.
+//   4. Update `BackstockMigrationPlan.schemas` to include V2.
+//
+// The single-file project keeps `Product`, `ScanSession`, etc. as
+// top-level types (where the rest of the code references them). V1
+// just lists those same types; V2+ will need to either keep the names
+// at top-level and migrate-in-place or introduce nested versioned
+// copies. Either is fine — pick whichever is shorter for the change.
+
+enum BackstockSchemaV1: VersionedSchema {
+    static var versionIdentifier = Schema.Version(1, 0, 0)
+
+    static var models: [any PersistentModel.Type] {
+        [
+            Product.self,
+            ScanSession.self,
+            ScannedItem.self,
+            CatalogSync.self,
+            AreaManager.self,
+            AreaManagerSync.self,
+            Store.self,
+            StoreSync.self
+        ]
+    }
+}
+
+enum BackstockMigrationPlan: SchemaMigrationPlan {
+    static var schemas: [any VersionedSchema.Type] {
+        [BackstockSchemaV1.self]
+    }
+
+    /// Empty until V2 lands. Each subsequent version contributes one
+    /// stage describing how to get from the previous version's shape
+    /// to its own.
+    static var stages: [MigrationStage] {
+        []
+    }
+}
+
 // MARK: - App entry
 
 @main
@@ -117,11 +171,10 @@ struct BackstockTrackerApp: App {
     // users with real data, swap this for a VersionedSchema migration
     // plan (see "Outstanding work" in CLAUDE.md).
     // Result of trying to bring up the SwiftData container. `container`
-    // is nil only in the absolute worst case where even an in-memory
-    // store couldn't be constructed — at that point we don't crash, we
-    // route the app to a recoverable error screen so the user can read
-    // what happened and act on it (delete + reinstall, or contact
-    // support) instead of seeing a hard crash.
+    // is nil only when ModelContainer init throws even with the
+    // VersionedSchema migration plan applied — i.e. real disk / sandbox
+    // failures, not schema drift. The user gets the StorageErrorView in
+    // that case rather than a crash.
     let container: ModelContainer?
     let bootError: BootError?
 
@@ -131,20 +184,17 @@ struct BackstockTrackerApp: App {
         self.bootError = result.error
     }
 
-    /// Three-tier recovery: normal store → wipe-and-retry → in-memory.
-    /// Returns a populated container on success, or a nil container
-    /// plus a structured error the UI can present.
+    /// Open the SwiftData store using `BackstockMigrationPlan`. The
+    /// migration plan handles forward-compatible schema evolution
+    /// automatically: lightweight changes (added optional properties,
+    /// new @Model types, new indexes) just work, and breaking changes
+    /// get explicit `MigrationStage.custom` entries when we add a V2.
+    ///
+    /// No more wipe-and-retry — that was a dev-only band-aid for the
+    /// previous crash-on-schema-drift behavior, and would silently
+    /// destroy user data in production. Real init failures now route
+    /// to StorageErrorView so the user can read what happened.
     private static func makeContainer() -> (container: ModelContainer?, error: BootError?) {
-        let schema = Schema([
-            Product.self,
-            ScanSession.self,
-            ScannedItem.self,
-            CatalogSync.self,
-            AreaManager.self,
-            AreaManagerSync.self,
-            Store.self,
-            StoreSync.self
-        ])
         // CRITICAL: cloudKitDatabase: .none disables SwiftData's
         // automatic private-database mirroring. Without this, enabling
         // the iCloud/CloudKit capability in Xcode makes SwiftData try
@@ -155,140 +205,40 @@ struct BackstockTrackerApp: App {
         // Our CloudKit use is intentional and narrow: CloudSyncService
         // writes team sessions to the PUBLIC database directly. We
         // never want SwiftData syncing the local audit store to iCloud.
-        let firstConfig = ModelConfiguration(
+        let schema = Schema(versionedSchema: BackstockSchemaV1.self)
+        let config = ModelConfiguration(
             schema: schema,
             cloudKitDatabase: .none
         )
-        print("ℹ️ SwiftData store URL: \(firstConfig.url.path)")
+        print("ℹ️ SwiftData store URL: \(config.url.path)")
 
         do {
-            return (try ModelContainer(for: schema, configurations: [firstConfig]), nil)
-        } catch let firstError {
-            print("⚠️ ModelContainer init failed: \(firstError)")
-            print("   Wiping SwiftData state and retrying (DEV RECOVERY).")
-            wipeAllSwiftDataState(hintedStoreURL: firstConfig.url)
-
-            // Fresh config for retry — also local-only.
-            let retryConfig = ModelConfiguration(
-                schema: schema,
-                cloudKitDatabase: .none
+            let container = try ModelContainer(
+                for: schema,
+                migrationPlan: BackstockMigrationPlan.self,
+                configurations: [config]
             )
-            do {
-                return (try ModelContainer(for: schema, configurations: [retryConfig]), nil)
-            } catch let retryError {
-                print("🚨 Retry also failed: \(retryError)")
-                print("🚨 Falling back to IN-MEMORY SwiftData store — " +
-                      "data will NOT persist between launches. " +
-                      "Delete and reinstall the app to recover.")
-                let memoryConfig = ModelConfiguration(
-                    schema: schema,
-                    isStoredInMemoryOnly: true,
-                    cloudKitDatabase: .none
-                )
-                do {
-                    return (try ModelContainer(for: schema, configurations: [memoryConfig]), nil)
-                } catch let memoryError {
-                    // We've exhausted recovery. Surface a structured
-                    // error to the UI rather than fatalError-ing out —
-                    // a clean error screen the user can read and act
-                    // on beats a hard crash with no signal.
-                    print("🛑 In-memory ModelContainer also failed: \(memoryError)")
-                    return (nil, BootError(
-                        firstError: "\(firstError)",
-                        retryError: "\(retryError)",
-                        memoryError: "\(memoryError)"
-                    ))
-                }
-            }
+            return (container, nil)
+        } catch {
+            print("🛑 ModelContainer init failed under migration plan: \(error)")
+            return (nil, BootError(message: "\(error)"))
         }
     }
 
-    /// Captured details from a failed three-tier container init.
-    /// Surfaced verbatim in the StorageErrorView so the user (or
-    /// support) has something to copy/paste.
+    /// Captured details from a failed container init. Surfaced verbatim
+    /// in StorageErrorView so the user (or support) has something to
+    /// copy / paste when reporting the problem.
     struct BootError {
-        let firstError: String
-        let retryError: String
-        let memoryError: String
+        let message: String
 
         var summary: String {
-            "Backstock Tracker can't start because the local storage " +
-            "couldn't be opened — even after a recovery wipe. This is " +
+            "Backstock Tracker can't open its local storage. This is " +
             "almost always fixed by deleting the app and reinstalling " +
-            "it from TestFlight."
+            "it from TestFlight — submitted sessions are stored in the " +
+            "cloud and will reappear after sign-in."
         }
 
-        var diagnosticDetails: String {
-            """
-            First attempt: \(firstError)
-
-            Retry after wipe: \(retryError)
-
-            In-memory fallback: \(memoryError)
-            """
-        }
-    }
-
-    // Nukes every file under the app's Library directory that looks like
-    // SwiftData / CoreData state. Much more aggressive than the previous
-    // targeted wipe — we walk Application Support AND the Library root,
-    // removing anything matching the usual store / sqlite / CoreData
-    // naming conventions. Acceptable in dev because we have no data
-    // worth preserving when a schema load fails.
-    private static func wipeAllSwiftDataState(hintedStoreURL: URL) {
-        let fm = FileManager.default
-        print("  → Hint URL: \(hintedStoreURL.path)")
-
-        // 1. Targeted delete of the hinted URL + sidecars.
-        let base = hintedStoreURL.deletingPathExtension()
-        let targeted: [URL] = [
-            hintedStoreURL,
-            base.appendingPathExtension("store-shm"),
-            base.appendingPathExtension("store-wal"),
-            hintedStoreURL.appendingPathExtension("shm"),
-            hintedStoreURL.appendingPathExtension("wal"),
-        ]
-        for url in targeted {
-            tryRemove(at: url, fm: fm)
-        }
-
-        // 2. Sweep Application Support + Library root for any CoreData
-        //    / SwiftData artifacts. The directories are small so a full
-        //    walk is cheap.
-        let sweepDirs: [URL] = [
-            (try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)),
-            (try? fm.url(for: .libraryDirectory, in: .userDomainMask, appropriateFor: nil, create: false))
-        ].compactMap { $0 }
-
-        for dir in sweepDirs {
-            sweepDirectory(at: dir, fm: fm)
-        }
-    }
-
-    private static func tryRemove(at url: URL, fm: FileManager) {
-        guard fm.fileExists(atPath: url.path) else { return }
-        do {
-            try fm.removeItem(at: url)
-            print("  ✓ Deleted \(url.lastPathComponent)")
-        } catch {
-            print("  ✗ Failed to delete \(url.lastPathComponent): \(error)")
-        }
-    }
-
-    private static func sweepDirectory(at dir: URL, fm: FileManager) {
-        guard let contents = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
-        for file in contents {
-            let name = file.lastPathComponent
-            let looksLikeStore =
-                name.hasPrefix("default.") ||
-                name.contains(".store") ||
-                name.hasSuffix(".sqlite") ||
-                name.hasSuffix(".sqlite-shm") ||
-                name.hasSuffix(".sqlite-wal") ||
-                name == "CoreData"
-            guard looksLikeStore else { continue }
-            tryRemove(at: file, fm: fm)
-        }
+        var diagnosticDetails: String { message }
     }
 
 
@@ -317,9 +267,7 @@ struct BackstockTrackerApp: App {
                     .modelContainer(container)
             } else {
                 StorageErrorView(error: bootError ?? BootError(
-                    firstError: "unknown",
-                    retryError: "unknown",
-                    memoryError: "container missing"
+                    message: "Container is nil but no error was captured."
                 ))
                 .tint(.jacentTeal)
             }

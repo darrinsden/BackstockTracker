@@ -37,9 +37,18 @@ Single-file Swift project (`BackstockTrackerApp.swift`, ~3000 lines, brace-balan
 - **Audio:** Synthesized 1800Hz confirm chirp (80ms), 380Hz buzzer (350ms). Audio session is `.playback`, primed at app launch.
 - **Camera fallback:** `CameraScannerView` (VisionKit `DataScannerViewController`). Closes 0.4s after success, stays open with red error on not-found, distinguishes "Not in catalog" from "Not in this store — available at X".
 
-## Schema migration policy (DEV ONLY)
+## Schema migration policy
 
-Container init currently uses `fatalError("ModelContainer failed: \(error)")`. Any change to a `@Model` class crashes existing installs. **During development, the workaround is to delete + reinstall the app.** Before production, replace with a `VersionedSchema` migration plan.
+Container init runs through `BackstockMigrationPlan` (a `SchemaMigrationPlan`). The plan currently lists one version, `BackstockSchemaV1`, which holds the eight `@Model` types (`Product`, `ScanSession`, `ScannedItem`, `CatalogSync`, `AreaManager`, `AreaManagerSync`, `Store`, `StoreSync`).
+
+**To make a schema change without breaking existing installs:**
+
+1. Copy `BackstockSchemaV1` to `BackstockSchemaV2`, bump `versionIdentifier`.
+2. Make the change inside V2.
+3. Add a `MigrationStage` entry to `BackstockMigrationPlan.stages`. Use `.lightweight(fromVersion:toVersion:)` for additive changes; `.custom(...)` for renames, splits, type changes, or anything that needs old-row data to populate new fields.
+4. Add V2 to `BackstockMigrationPlan.schemas`.
+
+If `ModelContainer` init throws despite the migration plan (real disk / sandbox failure, not schema drift), the App routes to `StorageErrorView` instead of crashing — the user gets a "Copy diagnostics" button and a delete-and-reinstall instruction.
 
 ## Coding conventions
 
@@ -82,7 +91,6 @@ Submitted sessions are pushed to `CKContainer("iCloud.com.jacent.BackstockTracke
 
 - [ ] Info.plist: `NSCameraUsageDescription` (required for App Store / TestFlight)
 - [ ] Info.plist: `BGAppRefreshTaskSchedulerPermittedIdentifiers` if we add background sync
-- [ ] Replace `fatalError` with `VersionedSchema` migration before any external user has prod data
 - [ ] HistoryView filter chips (All / Submitted / Over limit)
 - [ ] "Signed-in AM removed from roster" edge case
 - [ ] Enable CloudKit capability in Xcode + deploy schema to production before TestFlight release
