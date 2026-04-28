@@ -4194,6 +4194,15 @@ struct StoreHistoryList: View {
     // here — keeps this list focused on per-box browsing.
     @State private var showAllBackstock = false
 
+    // Find-an-item state. The AM types or scans into the same
+    // searchText — the camera path just pre-fills it from the
+    // detected UPC and dismisses. Substring match runs against UPC,
+    // item name, and commodity. While searchText is non-empty the
+    // box list is replaced by a flat results list so the AM can see
+    // every box that contains a hit at once.
+    @State private var searchText: String = ""
+    @State private var showScanner: Bool = false
+
     // Drives the "Remove all empty boxes" confirmation dialog. An
     // empty box is a CloudKit record with `items.isEmpty` — usually
     // a placeholder created by tapping Submit before scanning, or
@@ -4213,6 +4222,11 @@ struct StoreHistoryList: View {
     }
 
     enum LoadState { case loading, loaded, failed }
+
+    private var isLoaded: Bool {
+        if case .loaded = loadState { return true }
+        return false
+    }
 
     // Records narrowed to the AM's currently-scoped store. We always
     // fetch the area-wide feed, then filter here, rather than issuing
@@ -4247,6 +4261,53 @@ struct StoreHistoryList: View {
     // cleanup affordance is for.
     private var emptyBoxes: [TeamBackstockRecord] {
         sortedRecords.filter { $0.items.isEmpty }
+    }
+
+    // One match per (record, item) pair. The same UPC living in two
+    // boxes shows up as two hits — that's the point of the feature
+    // ("which boxes have this thing"). Stable id includes box so a
+    // SwiftUI ForEach doesn't fold duplicates.
+    struct SearchHit: Identifiable, Hashable {
+        let record: TeamBackstockRecord
+        let item: CloudSyncItem
+        var id: String { "\(record.id):\(item.upc):\(record.box ?? -1)" }
+    }
+
+    private var trimmedSearch: String {
+        searchText.trimmingCharacters(in: .whitespaces)
+    }
+
+    private var isSearching: Bool { !trimmedSearch.isEmpty }
+
+    // Substring match against UPC, name, and commodity. Lowercased
+    // both sides so name searches are case-insensitive. UPC is a
+    // substring match too — handles the 12-vs-13-digit inconsistency
+    // (typing "63411" matches both "0634118…" and "634118…") without
+    // needing a normalization ladder here. Sorted by box ascending so
+    // results read in the same aisle-walk order as the box list.
+    private var searchHits: [SearchHit] {
+        guard isSearching else { return [] }
+        let q = trimmedSearch.lowercased()
+        var hits: [SearchHit] = []
+        for record in sortedRecords {
+            for item in record.items {
+                let upcMatch       = item.upc.lowercased().contains(q)
+                let nameMatch      = item.name.lowercased().contains(q)
+                let commodityMatch = (item.commodity ?? "").lowercased().contains(q)
+                if upcMatch || nameMatch || commodityMatch {
+                    hits.append(SearchHit(record: record, item: item))
+                }
+            }
+        }
+        return hits.sorted { lhs, rhs in
+            switch (lhs.record.box, rhs.record.box) {
+            case let (l?, r?) where l != r: return l < r
+            case (_?, nil): return true
+            case (nil, _?): return false
+            default:
+                return lhs.record.submittedAt > rhs.record.submittedAt
+            }
+        }
     }
 
     var body: some View {
@@ -4285,13 +4346,31 @@ struct StoreHistoryList: View {
                 }
             }
 
+            // Find-an-item bar. AM types a UPC, name, or commodity
+            // — or taps the camera button to scan — and the box list
+            // below flips to a flat results list of every line item
+            // matching the query, across every box. Shown above the
+            // empty-box cleanup button so the most-actionable
+            // affordance is closest to the header.
+            //
+            // Hidden in loading / failed / empty states so we don't
+            // suggest the AM can find something in an empty list.
+            if isLoaded && !sortedRecords.isEmpty {
+                searchBar
+                    .overlay(alignment: .bottom) { Divider() }
+            }
+
             // "Remove all empty boxes" — only visible when there's
             // actually something to clean up. Styled as a destructive
             // peer to the View all button above: same row chrome,
             // red foreground so it doesn't read as a routine action,
             // no chevron (it's not a navigation push). Routes through
             // a confirmationDialog before issuing any deletes.
-            if !emptyBoxes.isEmpty {
+            //
+            // Suppressed during an active search — the cleanup
+            // affordance is about list-wide hygiene, which doesn't
+            // apply to the find-an-item flow the AM is in.
+            if !emptyBoxes.isEmpty && !isSearching {
                 Button {
                     pendingEmptyBoxesCleanup = true
                 } label: {
@@ -4353,6 +4432,8 @@ struct StoreHistoryList: View {
                             .padding(.horizontal)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if isSearching {
+                    searchResultsList
                 } else {
                     List {
                         ForEach(sortedRecords) { record in
@@ -4395,6 +4476,17 @@ struct StoreHistoryList: View {
                     .refreshable { await reload() }
                 }
                 }
+            }
+        }
+        .fullScreenCover(isPresented: $showScanner) {
+            // Reuse the same camera scanner the scan flow uses. We
+            // ignore the catalog-driven feedback (this is a backstock
+            // search, not a catalog lookup) — every scan returns
+            // .added, populates the search field, and dismisses.
+            CameraScannerView(notFoundUPC: nil, notFoundReason: nil) { upc in
+                searchText = upc
+                showScanner = false
+                return .added
             }
         }
         // "View all items" navigation. Pushes AllBackstockDetailView
@@ -4548,6 +4640,86 @@ struct StoreHistoryList: View {
             return "Box \(box)"
         }
         return "Box (\(record.submittedAt.formatted(date: .abbreviated, time: .omitted)))"
+    }
+
+    // MARK: - Search subviews
+
+    // Find-an-item bar. Mirrors the chrome of the "View all backstock"
+    // and "Remove empty boxes" rows above it (same tinted background,
+    // same horizontal/vertical padding) so the three header rows read
+    // as one cohesive band. The barcode-scan button sits to the right
+    // of the field — same icon as ScanView's launcher so AMs recognize
+    // it. Tapping it fires `showScanner`, which presents the same
+    // CameraScannerView that the scan flow uses (just with a different
+    // onScan handler that pre-fills searchText instead of submitting).
+    private var searchBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search by UPC, name, or commodity",
+                      text: $searchText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.search)
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            Button {
+                showScanner = true
+            } label: {
+                Image(systemName: "barcode.viewfinder")
+                    .font(.title3)
+                    .foregroundStyle(.tint)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Scan a barcode")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color(.secondarySystemGroupedBackground))
+    }
+
+    // Flat list of every (record, item) match for the active query.
+    // Pull-to-refresh stays wired so an AM mid-search can pick up
+    // freshly-submitted boxes from a teammate without exiting search.
+    @ViewBuilder
+    private var searchResultsList: some View {
+        let hits = searchHits
+        if hits.isEmpty {
+            VStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 36))
+                    .foregroundStyle(.secondary)
+                Text("No matches")
+                    .font(.headline)
+                Text("No item in this store's backstock matches “\(trimmedSearch)”.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            List {
+                Section {
+                    ForEach(hits) { hit in
+                        NavigationLink(value: hit.record) {
+                            SearchHitRow(hit: hit)
+                        }
+                    }
+                } header: {
+                    Text("\(hits.count) match\(hits.count == 1 ? "" : "es")")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .listStyle(.insetGrouped)
+            .refreshable { await reload() }
+        }
     }
 
     @MainActor
@@ -4898,6 +5070,70 @@ struct StoreHistoryRow: View {
             return "\(lines) items"
         }
         return "\(lines) items · \(units) units"
+    }
+
+    private func currency(_ value: Double) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .currency
+        f.locale = Locale(identifier: "en_US")
+        return f.string(from: NSNumber(value: value)) ?? "$\(value)"
+    }
+}
+
+// One row per search hit: name + Box chip + UPC + qty/price. Tapping
+// pushes the matched box's TeamSessionDetailView, where the AM can
+// see the rest of that box's contents and (if needed) edit the line.
+struct SearchHitRow: View {
+    let hit: StoreHistoryList.SearchHit
+
+    var body: some View {
+        let item = hit.item
+        let lineTotal = item.price * Double(item.quantity)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(item.name)
+                    .font(.subheadline).fontWeight(.semibold)
+                    .lineLimit(2)
+                Spacer(minLength: 4)
+                if let box = hit.record.box {
+                    // Same Box chip language as StoreHistoryRow so the
+                    // physical-box anchor reads identically across the
+                    // box list and the search-results list.
+                    Text("Box \(box)")
+                        .font(.caption2).fontWeight(.medium)
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.horizontal, 6).padding(.vertical, 1)
+                        .background(Color.accentColor.opacity(0.14))
+                        .clipShape(Capsule())
+                }
+            }
+            HStack(spacing: 6) {
+                Text(item.upc)
+                    .font(.caption2).monospaced()
+                    .foregroundStyle(.tertiary)
+                if let commodity = item.commodity, !commodity.isEmpty {
+                    Text("·").font(.caption2).foregroundStyle(.tertiary)
+                    Text(commodity)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if item.quantity > 1 {
+                    Text("× \(item.quantity)")
+                        .font(.caption).fontWeight(.semibold)
+                        .monospacedDigit()
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.horizontal, 6).padding(.vertical, 1)
+                        .background(Color.accentColor.opacity(0.14))
+                        .clipShape(Capsule())
+                }
+                Text(currency(lineTotal))
+                    .font(.caption).fontWeight(.medium)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+        }
+        .padding(.vertical, 4)
     }
 
     private func currency(_ value: Double) -> String {
