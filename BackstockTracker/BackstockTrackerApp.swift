@@ -6269,7 +6269,11 @@ struct AllBackstockDetailView: View {
             }
         }
         .sheet(isPresented: $showPickList) {
-            PickListSheet()
+            // Hand the sheet the same records slice the line items
+            // are rendered from. The "Remove from backstock" action
+            // needs them to compute new quantities + subtotals before
+            // pushing the update to CloudKit.
+            PickListSheet(availableRecords: records)
         }
         .sheet(item: $pendingPick) { pick in
             PickQuantitySheet(
@@ -6835,6 +6839,18 @@ struct PickListSheet: View {
     @Environment(PickListStore.self) private var store
     @Environment(\.dismiss) private var dismiss
 
+    /// Records currently visible on the parent screen — used by the
+    /// "Remove from backstock" action to look up live quantities and
+    /// recompute subtotals before pushing back to CloudKit. Picked
+    /// items whose recordId isn't in this slice (e.g. queued from a
+    /// different store) are left alone with a warning.
+    let availableRecords: [TeamBackstockRecord]
+
+    @State private var pendingRemove: Bool = false
+    @State private var isProcessing: Bool = false
+    @State private var errorMessage: String?
+    @State private var showError: Bool = false
+
     // Group by box for readability — when an AM is walking from box
     // to box they'd rather see the items grouped than scattered.
     // Within a group we preserve insertion order (chronological flag
@@ -6916,25 +6932,169 @@ struct PickListSheet: View {
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Menu {
+                        // Top-level destructive action: takes every
+                        // checked-off item, decrements its quantity in
+                        // the source box (or drops the line if it
+                        // hits zero), and removes the entry from the
+                        // pick list. Replaces the previous "Clear
+                        // picked" affordance — clearing without
+                        // updating the source data was a footgun.
                         Button(role: .destructive) {
-                            store.clearPicked()
+                            pendingRemove = true
                         } label: {
-                            Label("Clear picked (\(store.pickedCount))",
-                                  systemImage: "checkmark.circle")
+                            Label("Remove from backstock (\(store.pickedCount))",
+                                  systemImage: "tray.and.arrow.up")
                         }
-                        .disabled(store.pickedCount == 0)
+                        .disabled(store.pickedCount == 0 || isProcessing)
 
                         Button(role: .destructive) {
                             store.clearAll()
                         } label: {
                             Label("Clear all", systemImage: "trash")
                         }
-                        .disabled(store.items.isEmpty)
+                        .disabled(store.items.isEmpty || isProcessing)
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
                 }
             }
+            .confirmationDialog(
+                "Remove \(store.pickedCount) item\(store.pickedCount == 1 ? "" : "s") from backstock?",
+                isPresented: $pendingRemove,
+                titleVisibility: .visible
+            ) {
+                Button("Remove from backstock", role: .destructive) {
+                    Task { await removePickedFromBackstock() }
+                }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text("This decrements the picked items' quantities in their source boxes. Lines that reach zero are removed entirely. Everyone in your area will see the update.")
+            }
+            .alert(
+                "Couldn't remove all items",
+                isPresented: $showError,
+                presenting: errorMessage
+            ) { _ in
+                Button("OK", role: .cancel) { errorMessage = nil }
+            } message: { msg in
+                Text(msg)
+            }
+            .overlay {
+                if isProcessing {
+                    Color.black.opacity(0.18).ignoresSafeArea()
+                    ProgressView("Updating backstock…")
+                        .padding(20)
+                        .background(.regularMaterial)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                }
+            }
+        }
+    }
+
+    /// Apply every checked-off pick to the cloud. Aggregates by
+    /// (recordId, upc) so picking 3 of the same SKU decrements once
+    /// by 3 instead of three race-prone single-unit updates. Items
+    /// whose source record isn't in `availableRecords` (queued from
+    /// a different store the AM has since left) stay on the list and
+    /// surface as a warning at the end.
+    @MainActor
+    private func removePickedFromBackstock() async {
+        let picked = store.items.filter(\.picked)
+        guard !picked.isEmpty else { return }
+
+        // recordId → upc → number of picked units
+        var byRecord: [String: [String: Int]] = [:]
+        for p in picked {
+            byRecord[p.recordId, default: [:]][p.upc, default: 0] += 1
+        }
+
+        isProcessing = true
+        defer { isProcessing = false }
+
+        var processedIDs: Set<UUID> = []
+        var failures: [String] = []
+        var skippedOrphans: Int = 0
+
+        for (recordId, upcCounts) in byRecord {
+            guard let record = availableRecords.first(where: { $0.id == recordId }) else {
+                // Item was flagged from a different store the AM no
+                // longer has loaded. Leave it on the list — they can
+                // navigate back to that store and run the action
+                // again. Tally for the warning summary.
+                skippedOrphans += picked.filter { $0.recordId == recordId }.count
+                continue
+            }
+
+            // Build the post-removal items array. Every UPC in
+            // upcCounts gets its quantity decremented by the picked
+            // count; lines that reach ≤ 0 are dropped entirely.
+            var newItems: [CloudSyncItem] = []
+            for item in record.items {
+                let removed = upcCounts[item.upc] ?? 0
+                let remaining = item.quantity - removed
+                if remaining > 0 {
+                    newItems.append(CloudSyncItem(
+                        upc: item.upc,
+                        name: item.name,
+                        quantity: remaining,
+                        price: item.price,
+                        retailPrice: item.retailPrice,
+                        rank: item.rank,
+                        commodity: item.commodity
+                    ))
+                }
+            }
+
+            let newSubtotal = newItems.reduce(0.0) { $0 + $1.price * Double($1.quantity) }
+            let newRetail = newItems.reduce(0.0) {
+                $0 + ($1.retailPrice ?? 0) * Double($1.quantity)
+            }
+
+            do {
+                try await CloudSyncService.shared.updateItems(
+                    sessionUUID: record.id,
+                    items: newItems,
+                    subtotal: newSubtotal,
+                    retailTotal: newRetail
+                )
+                // Stage every picked id from this record for removal
+                // — succeed-together semantics so the local list
+                // mirrors the cloud state.
+                for p in picked where p.recordId == recordId {
+                    processedIDs.insert(p.id)
+                }
+            } catch {
+                let label = record.box.map { "Box \($0)" } ?? "Unboxed"
+                failures.append("\(label): \(error.localizedDescription)")
+            }
+        }
+
+        // Prune the local pick list to match what the cloud now reflects.
+        for id in processedIDs {
+            store.remove(id)
+        }
+
+        // Tell the parent list views to refetch / refresh — the
+        // subtotals / line counts they're showing are now stale.
+        if !processedIDs.isEmpty {
+            NotificationCenter.default.post(name: .teamSessionDidUpdate, object: nil)
+        }
+
+        // Surface anything that didn't go through.
+        var lines: [String] = []
+        if !failures.isEmpty {
+            lines.append("Some boxes couldn't be updated:\n" + failures.joined(separator: "\n"))
+        }
+        if skippedOrphans > 0 {
+            lines.append("\(skippedOrphans) item\(skippedOrphans == 1 ? "" : "s") were flagged from a different store and were left on the list.")
+        }
+        if !lines.isEmpty {
+            errorMessage = lines.joined(separator: "\n\n")
+            showError = true
+        } else {
+            // Clean run — close the sheet so the AM lands back on the
+            // (now-fresh) line items list.
+            dismiss()
         }
     }
 
