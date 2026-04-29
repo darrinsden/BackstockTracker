@@ -6053,9 +6053,20 @@ struct ShareURL: Identifiable {
 // whole store at a glance." If they need to edit, they tap into the
 // box from the History list.
 struct AllBackstockDetailView: View {
-    let records: [TeamBackstockRecord]
+    // @State so the pick-list "Remove from backstock" action (and any
+    // future per-record edits initiated from this screen) can patch
+    // the visible records in place via .teamSessionDidUpdate userInfo
+    // — without requiring a pop-and-re-push to see the new totals.
+    // Initialized from the parent's snapshot via the custom init below.
+    @State private var records: [TeamBackstockRecord]
     let storeShortNames: [String: String]
     let storeNumber: String
+
+    init(records: [TeamBackstockRecord], storeShortNames: [String: String], storeNumber: String) {
+        _records = State(initialValue: records)
+        self.storeShortNames = storeShortNames
+        self.storeNumber = storeNumber
+    }
 
     @State private var sortOrder: ScanSortOrder = .rank
     // Unified find-an-item search. Substring match across UPC, item
@@ -6274,6 +6285,23 @@ struct AllBackstockDetailView: View {
             // needs them to compute new quantities + subtotals before
             // pushing the update to CloudKit.
             PickListSheet(availableRecords: records)
+        }
+        // Patch local records when a per-record update lands —
+        // typically from PickListSheet's "Remove from backstock"
+        // action, which fires one notification per affected record
+        // with the freshly-rebuilt TeamBackstockRecord under
+        // userInfo["record"]. Records whose items array becomes
+        // empty are dropped from the list so the AM doesn't see a
+        // ghost row with zero items.
+        .onReceive(NotificationCenter.default.publisher(for: .teamSessionDidUpdate)) { note in
+            guard let updated = note.userInfo?["record"] as? TeamBackstockRecord else { return }
+            if let idx = records.firstIndex(where: { $0.id == updated.id }) {
+                if updated.items.isEmpty {
+                    records.remove(at: idx)
+                } else {
+                    records[idx] = updated
+                }
+            }
         }
         .sheet(item: $pendingPick) { pick in
             PickQuantitySheet(
@@ -7063,6 +7091,23 @@ struct PickListSheet: View {
                 for p in picked where p.recordId == recordId {
                     processedIDs.insert(p.id)
                 }
+
+                // Per-record .teamSessionDidUpdate notification with
+                // the freshly-rebuilt TeamBackstockRecord. The
+                // AllBackstockDetailView listener (and the
+                // StoreHistoryList one) patch in place from this so
+                // the AM sees the new totals immediately on the
+                // screen they were already on, without a pop-and-
+                // re-push.
+                var updatedRecord = record
+                updatedRecord.items = newItems
+                updatedRecord.subtotal = newSubtotal
+                updatedRecord.retailTotal = newRetail
+                NotificationCenter.default.post(
+                    name: .teamSessionDidUpdate,
+                    object: nil,
+                    userInfo: ["record": updatedRecord]
+                )
             } catch {
                 let label = record.box.map { "Box \($0)" } ?? "Unboxed"
                 failures.append("\(label): \(error.localizedDescription)")
@@ -7072,12 +7117,6 @@ struct PickListSheet: View {
         // Prune the local pick list to match what the cloud now reflects.
         for id in processedIDs {
             store.remove(id)
-        }
-
-        // Tell the parent list views to refetch / refresh — the
-        // subtotals / line counts they're showing are now stale.
-        if !processedIDs.isEmpty {
-            NotificationCenter.default.post(name: .teamSessionDidUpdate, object: nil)
         }
 
         // Surface anything that didn't go through.
