@@ -1343,19 +1343,20 @@ actor CloudSyncService {
 // wants when they're walking back to pull each one separately.
 
 struct PickListItem: Codable, Hashable, Identifiable {
+    /// Unique per individual unit. The AM tracks each physical unit
+    /// they need to pull as its own row — flagging "3 of X" produces
+    /// three separate PickListItems. Generated on add; persists.
+    let id: UUID
     let recordId: String       // CloudKit record id for the box
     let upc: String
     let name: String
     let box: Int?
     let storeName: String
     let storeNumber: String
-    let quantity: Int
     let price: Double
     let commodity: String?
     let addedAt: Date
     var picked: Bool
-
-    var id: String { "\(recordId):\(upc)" }
 }
 
 @Observable
@@ -1363,7 +1364,12 @@ struct PickListItem: Codable, Hashable, Identifiable {
 final class PickListStore {
     static let shared = PickListStore()
 
-    private static let storageKey = "pickList.v1"
+    /// Bumped from v1 → v2 when the schema flipped from
+    /// "one row per (record, upc) carrying a quantity" to "one row
+    /// per individual unit." Old v1 data isn't migrated — the
+    /// feature is new enough that any in-flight lists are
+    /// disposable.
+    private static let storageKey = "pickList.v2"
 
     private(set) var items: [PickListItem] = []
 
@@ -1371,37 +1377,63 @@ final class PickListStore {
         load()
     }
 
-    /// Number of items still to pull (haven't been checked off).
+    /// Number of individual units still to pull (not yet checked off).
     var pendingCount: Int { items.filter { !$0.picked }.count }
 
     /// Total flagged regardless of picked state — drives the "Clear
     /// picked" affordance visibility.
     var pickedCount: Int { items.filter { $0.picked }.count }
 
+    /// True when at least one row exists for this (record, upc) pair.
+    /// The bookmark icon on the search results uses this to flip
+    /// between filled (flagged) and outlined (not).
     func isFlagged(recordId: String, upc: String) -> Bool {
         items.contains(where: { $0.recordId == recordId && $0.upc == upc })
     }
 
-    /// Add if absent, remove if present. The bookmark button on a
-    /// search result row binds to this. Newly-added items go to the
-    /// end (chronological flag order — useful when reading the list
-    /// back, since the AM remembers the order they hit each item).
-    func toggle(_ item: PickListItem) {
-        if let idx = items.firstIndex(where: { $0.id == item.id }) {
-            items.remove(at: idx)
-        } else {
-            items.append(item)
+    /// Add `count` individual rows from the same template. Each gets
+    /// its own UUID so the sheet can render and toggle them
+    /// independently.
+    func addRows(template: PickListItem, count: Int) {
+        guard count > 0 else { return }
+        for _ in 0..<count {
+            var copy = template
+            // Force a fresh id for every appended row even if the
+            // template already had one. We can't rely on the caller
+            // to mint UUIDs.
+            copy = PickListItem(
+                id: UUID(),
+                recordId: template.recordId,
+                upc: template.upc,
+                name: template.name,
+                box: template.box,
+                storeName: template.storeName,
+                storeNumber: template.storeNumber,
+                price: template.price,
+                commodity: template.commodity,
+                addedAt: .now,
+                picked: false
+            )
+            items.append(copy)
         }
         persist()
     }
 
-    func setPicked(_ id: String, picked: Bool) {
+    /// Bookmark-tap-while-flagged path — pulls every row for a
+    /// given (record, upc) pair off the list in one shot, regardless
+    /// of how many copies the AM had queued up.
+    func removeAllFor(recordId: String, upc: String) {
+        items.removeAll { $0.recordId == recordId && $0.upc == upc }
+        persist()
+    }
+
+    func setPicked(_ id: UUID, picked: Bool) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
         items[idx].picked = picked
         persist()
     }
 
-    func remove(_ id: String) {
+    func remove(_ id: UUID) {
         items.removeAll { $0.id == id }
         persist()
     }
@@ -6663,14 +6695,15 @@ struct AllBackstockDetailView: View {
         .padding(.vertical, 10)
     }
 
-    /// Tapping the bookmark on a flagged row removes it immediately.
-    /// Tapping on an unflagged row opens the quantity-pick sheet so
-    /// the AM can specify how many of the box's stock they actually
-    /// want to pull (rarely all of it). The qty=1 case shortcuts the
-    /// sheet — there's nothing to choose, so we just add.
+    /// Tapping the bookmark on a flagged row removes every queued
+    /// unit for that (record, upc) pair at once. Tapping on an
+    /// unflagged row opens the quantity-pick sheet so the AM can
+    /// say "I need 2 of these 5" — that count becomes N individual
+    /// rows on the pick list. The qty=1 case shortcuts the sheet
+    /// since there's nothing to choose.
     private func togglePickList(flat: FlatItem) {
         if pickList.isFlagged(recordId: flat.recordId, upc: flat.item.upc) {
-            pickList.remove("\(flat.recordId):\(flat.item.upc)")
+            pickList.removeAllFor(recordId: flat.recordId, upc: flat.item.upc)
             return
         }
         if flat.item.quantity <= 1 {
@@ -6680,31 +6713,32 @@ struct AllBackstockDetailView: View {
         }
     }
 
-    /// Build a PickListItem from the current FlatItem row context and
-    /// commit it to the store. Pulls the storeName from the owning
-    /// record so the list-back-on-the-floor view can show where each
-    /// item lives even after the AM has navigated away from the
-    /// per-store screen.
+    /// Append N individual pick-list rows from the FlatItem row
+    /// context. Each row is one physical unit the AM will check off
+    /// independently as they pull it from the box. Pulls storeName
+    /// from the owning record so the sheet can show where each unit
+    /// lives even after the AM has navigated away from the per-
+    /// store screen.
     private func addToPickList(flat: FlatItem, quantity: Int) {
         guard let record = records.first(where: { $0.id == flat.recordId }) else { return }
-        let entry = PickListItem(
+        // Clamp defensively — the sheet's Stepper already enforces
+        // this, but the qty=1 shortcut path skips the sheet, and a
+        // future caller might pass something looser.
+        let count = max(1, min(quantity, flat.item.quantity))
+        let template = PickListItem(
+            id: UUID(),                 // overwritten per-row inside addRows
             recordId: record.id,
             upc: flat.item.upc,
             name: flat.item.name,
             box: flat.box,
             storeName: record.storeName,
             storeNumber: record.storeNumber,
-            // Clamp to the box's available count as a defensive
-            // measure — the sheet's Stepper already enforces this,
-            // but the qty=1 shortcut path skips the sheet, and a
-            // future caller might pass something looser.
-            quantity: max(1, min(quantity, flat.item.quantity)),
             price: flat.item.price,
             commodity: flat.item.commodity,
             addedAt: .now,
             picked: false
         )
-        pickList.toggle(entry)
+        pickList.addRows(template: template, count: count)
     }
 
     private func rankColor(_ rank: Int) -> Color {
@@ -6930,13 +6964,7 @@ struct PickListSheet: View {
                                 .font(.caption2).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        if item.quantity > 1 {
-                            Text("× \(item.quantity)")
-                                .font(.caption2).fontWeight(.medium)
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        }
-                        Text(currency(item.price * Double(item.quantity)))
+                        Text(currency(item.price))
                             .font(.caption).foregroundStyle(.secondary)
                             .monospacedDigit()
                     }
