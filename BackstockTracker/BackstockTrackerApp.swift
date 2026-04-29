@@ -6052,6 +6052,16 @@ struct AllBackstockDetailView: View {
     @Environment(PickListStore.self) private var pickList
     @State private var showPickList: Bool = false
 
+    // Drives the "how many to pick" sheet on flag-add. Identifiable
+    // wrapper so SwiftUI's `sheet(item:)` re-presents cleanly when the
+    // AM opens the picker, cancels, then picks a different row.
+    @State private var pendingPick: PendingPick?
+
+    struct PendingPick: Identifiable {
+        let flat: FlatItem
+        var id: String { "\(flat.recordId):\(flat.item.upc)" }
+    }
+
     // Flattened item + box info. Box is denormalized onto each row
     // because we no longer have the parent record context once the
     // list is sorted by name / price / etc. recordId is on hand for
@@ -6228,6 +6238,15 @@ struct AllBackstockDetailView: View {
         }
         .sheet(isPresented: $showPickList) {
             PickListSheet()
+        }
+        .sheet(item: $pendingPick) { pick in
+            PickQuantitySheet(
+                item: pick.flat.item,
+                box: pick.flat.box,
+                maxQuantity: pick.flat.item.quantity
+            ) { chosen in
+                addToPickList(flat: pick.flat, quantity: chosen)
+            }
         }
         .sheet(item: $shareItem) { wrap in
             TeamActivityView(items: [wrap.url])
@@ -6644,12 +6663,29 @@ struct AllBackstockDetailView: View {
         .padding(.vertical, 10)
     }
 
-    /// Build a PickListItem from the current FlatItem row context and
-    /// toggle it through the store. Pulls the storeName from the
-    /// owning record so the list-back-on-the-floor view can show
-    /// where each item lives even after the AM has navigated away
-    /// from the per-store screen.
+    /// Tapping the bookmark on a flagged row removes it immediately.
+    /// Tapping on an unflagged row opens the quantity-pick sheet so
+    /// the AM can specify how many of the box's stock they actually
+    /// want to pull (rarely all of it). The qty=1 case shortcuts the
+    /// sheet — there's nothing to choose, so we just add.
     private func togglePickList(flat: FlatItem) {
+        if pickList.isFlagged(recordId: flat.recordId, upc: flat.item.upc) {
+            pickList.remove("\(flat.recordId):\(flat.item.upc)")
+            return
+        }
+        if flat.item.quantity <= 1 {
+            addToPickList(flat: flat, quantity: 1)
+        } else {
+            pendingPick = PendingPick(flat: flat)
+        }
+    }
+
+    /// Build a PickListItem from the current FlatItem row context and
+    /// commit it to the store. Pulls the storeName from the owning
+    /// record so the list-back-on-the-floor view can show where each
+    /// item lives even after the AM has navigated away from the
+    /// per-store screen.
+    private func addToPickList(flat: FlatItem, quantity: Int) {
         guard let record = records.first(where: { $0.id == flat.recordId }) else { return }
         let entry = PickListItem(
             recordId: record.id,
@@ -6658,7 +6694,11 @@ struct AllBackstockDetailView: View {
             box: flat.box,
             storeName: record.storeName,
             storeNumber: record.storeNumber,
-            quantity: flat.item.quantity,
+            // Clamp to the box's available count as a defensive
+            // measure — the sheet's Stepper already enforces this,
+            // but the qty=1 shortcut path skips the sheet, and a
+            // future caller might pass something looser.
+            quantity: max(1, min(quantity, flat.item.quantity)),
             price: flat.item.price,
             commodity: flat.item.commodity,
             addedAt: .now,
@@ -6912,6 +6952,88 @@ struct PickListSheet: View {
         f.numberStyle = .currency
         f.locale = Locale(identifier: "en_US")
         return f.string(from: NSNumber(value: value)) ?? "$\(value)"
+    }
+}
+
+// Asks "how many of this item do you want to pull?" before flagging
+// a backstock row to the pick list. Default is 1 (the most common
+// case — an AM rarely needs the entire box's stock at once). Capped
+// at the box's available quantity so the picked qty can't exceed
+// what's actually there. Skipped entirely on qty=1 rows since
+// there's nothing to choose.
+struct PickQuantitySheet: View {
+    let item: CloudSyncItem
+    let box: Int?
+    let maxQuantity: Int
+    let onAdd: (Int) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var quantity: Int = 1
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(item.name)
+                            .font(.headline)
+                        HStack(spacing: 6) {
+                            if let box {
+                                Text("Box \(box)")
+                                    .font(.caption2).fontWeight(.medium)
+                                    .foregroundStyle(Color.accentColor)
+                                    .padding(.horizontal, 6).padding(.vertical, 1)
+                                    .background(Color.accentColor.opacity(0.14))
+                                    .clipShape(Capsule())
+                            }
+                            Text(item.upc)
+                                .monospaced()
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text("\(maxQuantity) in box")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                Section {
+                    Stepper(value: $quantity, in: 1...max(1, maxQuantity)) {
+                        HStack {
+                            Text("Quantity to pull")
+                            Spacer()
+                            Text("\(quantity)")
+                                .font(.title3.monospacedDigit())
+                                .fontWeight(.semibold)
+                                .foregroundStyle(Color.accentColor)
+                        }
+                    }
+                } footer: {
+                    Text("Capped at \(maxQuantity) — the number in this box.")
+                }
+            }
+            .navigationTitle("Add to pick list")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        onAdd(quantity)
+                        dismiss()
+                    } label: {
+                        Text("Add")
+                            .fontWeight(.semibold)
+                    }
+                }
+            }
+            .presentationDetents([.medium])
+            .presentationDragIndicator(.visible)
+        }
     }
 }
 
