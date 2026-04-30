@@ -1068,11 +1068,40 @@ actor CloudSyncService {
         record["subtotal"]    = subtotal as CKRecordValue
         record["retailTotal"] = retailTotal as CKRecordValue
 
+        // PER-RECORD result + .allKeys to match the upload path's
+        // robustness profile.
+        //
+        // Why .allKeys: an earlier version used .changedKeys, which
+        // bit us on the pick-list "Remove from backstock" path —
+        // CloudKit's dirty-tracking on a reused CKRecord didn't
+        // reliably detect itemsJSON as changed in some flows, the
+        // save accepted but the field wasn't actually updated, and
+        // the next CKQuery returned the pre-removal items. .allKeys
+        // pushes every field every time; the round-trip cost is
+        // trivially small (≤1 KB) and the reliability is worth it.
+        //
+        // Why perRecordResultBlock: modifyRecordsResultBlock only
+        // surfaces the OVERALL operation result. CloudKit can mark
+        // an op "successful" even when individual records had
+        // server-side conflicts. Hooking the per-record block lets
+        // us throw the actual record's error instead of swallowing
+        // it as a no-op success.
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let op = CKModifyRecordsOperation(recordsToSave: [record], recordIDsToDelete: nil)
             op.qualityOfService = .userInitiated
-            op.savePolicy = .changedKeys
+            op.savePolicy = .allKeys
+
+            var perRecordError: Error?
+            op.perRecordSaveBlock = { _, result in
+                if case let .failure(err) = result {
+                    perRecordError = err
+                }
+            }
             op.modifyRecordsResultBlock = { result in
+                if let err = perRecordError {
+                    cont.resume(throwing: err)
+                    return
+                }
                 switch result {
                 case .success: cont.resume()
                 case .failure(let err): cont.resume(throwing: err)
