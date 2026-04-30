@@ -83,6 +83,7 @@ Submitted sessions are pushed to `CKContainer("iCloud.com.jacent.BackstockTracke
 - Enable iCloud capability in Xcode (Signing & Capabilities → + Capability → iCloud → CloudKit → container `iCloud.com.jacent.BackstockTracker`)
 - First app run auto-generates the Development schema on first save
 - In the CloudKit Dashboard: make `submittedAt` **Sortable** and `area` **Queryable** (both under Schema → Indexes) before deploying to Production
+- **Open `BackstockSession` write/delete permissions** — Schema → Record Types → BackstockSession → Security tab → set both **Write** and **Delete** to **Authenticated** (the public-DB default is **Creator**, which only lets the original submitter modify the record). This is what enables team-edit, the box delete affordance, and the pick-list "Remove from backstock" cross-AM workflow. Without it, any non-creator update returns `CKError.permissionFailure` ("WRITE operation not permitted").
 - Deploy Schema to Production before App Store release
 
 **Retry on launch:** `CloudSyncService.retryPending` sweeps for local sessions with `cloudSyncedAt == nil` and uploads them, so a network blip at submit time doesn't drop records from the team feed.

@@ -7313,7 +7313,7 @@ struct PickListSheet: View {
                 )
             } catch {
                 let label = record.box.map { "Box \($0)" } ?? "Unboxed"
-                failures.append("\(label): \(error.localizedDescription)")
+                failures.append("\(label): \(Self.humanReadable(error: error))")
             }
         }
 
@@ -7382,6 +7382,29 @@ struct PickListSheet: View {
         f.numberStyle = .currency
         f.locale = Locale(identifier: "en_US")
         return f.string(from: NSNumber(value: value)) ?? "$\(value)"
+    }
+
+    /// Translate CloudKit's raw error text into something an AM can
+    /// actually act on. The most common failure on this path is
+    /// `permissionFailure` ("WRITE operation not permitted") —
+    /// CloudKit's public-DB default is creator-only writes, so an AM
+    /// trying to update a box another teammate submitted gets
+    /// denied. Other CKError codes get bespoke prose; everything else
+    /// falls through to the underlying localizedDescription.
+    private static func humanReadable(error: Error) -> String {
+        if let ck = error as? CKError {
+            switch ck.code {
+            case .permissionFailure:
+                return "Only the AM who originally submitted this box can edit it. Ask an admin to enable team writes in the CloudKit Dashboard: Schema → Record Types → BackstockSession → Security → Write: Authenticated."
+            case .notAuthenticated:
+                return "iCloud isn't signed in on this device. Settings → [Your Name] → iCloud."
+            case .networkUnavailable, .networkFailure:
+                return "Couldn't reach iCloud. Check your connection and try again."
+            default:
+                break
+            }
+        }
+        return error.localizedDescription
     }
 }
 
