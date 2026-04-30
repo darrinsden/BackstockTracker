@@ -2814,16 +2814,42 @@ struct StorePickerView: View {
 
     /// Secondary detail row under the headline — error message on
     /// failure, area-mismatch hint after a partial-success sync,
-    /// nothing otherwise.
+    /// nothing otherwise. The mismatch hint lists every distinct
+    /// area string the synced stores actually carry, so the AM can
+    /// see exactly what their selected area would have to match
+    /// (case-sensitive, exact). Almost always points at one of two
+    /// problems: the AM's area string drifted from the CSV, or the
+    /// CSV's area column was populated with territory names.
     private var detailText: String? {
         switch storeCoordinator.state {
         case .failed(let message):
             return message
         case .succeeded(let count) where count > 0:
-            return "Check Settings → Area to make sure your area string matches the stores.csv exactly."
+            let areas = availableAreasInStores
+            if areas.isEmpty {
+                return "All \(count) synced stores have a blank area in the CSV — they should still appear in the picker. Try restarting the app."
+            }
+            let list = areas.prefix(8).joined(separator: ", ")
+            let suffix = areas.count > 8 ? ", +\(areas.count - 8) more" : ""
+            return "stores.csv has these areas: \(list)\(suffix). Match your area exactly (case-sensitive)."
         default:
             return nil
         }
+    }
+
+    /// Distinct, sorted area strings from the locally-synced Store
+    /// rows. Used by the empty card to surface what the CSV actually
+    /// carries when none of them match the AM's selected area.
+    private var availableAreasInStores: [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for s in allStores where !s.area.isEmpty {
+            if !seen.contains(s.area) {
+                seen.insert(s.area)
+                result.append(s.area)
+            }
+        }
+        return result.sorted()
     }
 
     /// Tints the detail line red on real errors, orange on
