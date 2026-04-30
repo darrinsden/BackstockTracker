@@ -2564,6 +2564,12 @@ struct StorePickerView: View {
     @State private var draftStore: String = ""
     @State private var draftNumber: String = ""
 
+    // Live store-sync state so the inline "Sync stores now" button
+    // can show a spinner / error without us having to mirror the
+    // coordinator's state into local @State. Same pattern as
+    // SettingsView's sync row.
+    @State private var storeCoordinator = StoreSyncCoordinator.shared
+
     private var storeService: StoreService { StoreService(context: context) }
 
     private var storeNames: [String] {
@@ -2666,18 +2672,17 @@ struct StorePickerView: View {
                 .disabled(!canContinue)
 
                 // When area is set but no stores have synced yet, the
-                // dropdowns will be empty — surface that explicitly so
-                // the AM knows to pull in Settings.
+                // dropdowns are empty. Previously we just told the AM
+                // to navigate to Settings → Stores → Sync now — but
+                // the Continue button is disabled in this state, so
+                // they're stuck on this screen with no way out (most
+                // common when the launch sync raced with bad / no
+                // service). Surface a Sync-stores-now button right
+                // here so the recovery is one tap away, and watch the
+                // coordinator's state to render progress / errors
+                // inline.
                 if storeNames.isEmpty {
-                    HStack(spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                        Text(selectedArea.isEmpty
-                             ? "Pick an area first."
-                             : "No stores for \(selectedArea) yet. Try Settings → Stores → Sync now.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    storesEmptyCard
                 }
             }
             .padding(20)
@@ -2691,6 +2696,79 @@ struct StorePickerView: View {
             draftStore = selectedStore
             draftNumber = selectedStoreNumber
         }
+    }
+
+    /// Inline recovery card shown when the local stores table is
+    /// empty. If the AM hasn't picked an area yet, just tell them to
+    /// — there's nothing useful to sync for an empty area. Once
+    /// they've picked one, render a real "Sync stores now" button
+    /// that calls StoreSyncCoordinator and shows progress / errors
+    /// without forcing them through Settings.
+    @ViewBuilder
+    private var storesEmptyCard: some View {
+        if selectedArea.isEmpty {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("Pick an area first.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("No stores synced for \(selectedArea) yet.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        // If the most recent sync attempt actually
+                        // came back failed (vs just never having run
+                        // because the launch sync was offline), show
+                        // the underlying error so the AM can tell
+                        // network from configuration trouble.
+                        if case let .failed(message) = storeCoordinator.state {
+                            Text(message)
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                                .lineLimit(3)
+                        }
+                    }
+                }
+
+                Button {
+                    Task {
+                        await StoreSyncCoordinator.shared.run(container: context.container)
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        if isSyncingStores {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        Text(isSyncingStores ? "Syncing stores…" : "Sync stores now")
+                            .fontWeight(.medium)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .disabled(isSyncingStores)
+            }
+            .padding(14)
+            .background(Color(.secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+    /// True while the StoreSyncCoordinator is mid-fetch. Pulled out
+    /// of the @ViewBuilder so the `if case` doesn't trip the
+    /// type-checker inside the disabled / button-label expressions.
+    private var isSyncingStores: Bool {
+        if case .syncing = storeCoordinator.state { return true }
+        return false
     }
 
     // Shared dropdown look — filled pill with a chevron, primary text
