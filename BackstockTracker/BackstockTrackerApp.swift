@@ -2570,18 +2570,43 @@ struct StorePickerView: View {
     // SettingsView's sync row.
     @State private var storeCoordinator = StoreSyncCoordinator.shared
 
-    private var storeService: StoreService { StoreService(context: context) }
+    /// SwiftData @Query so the picker auto-refreshes the moment new
+    /// stores land in the local store — `StoreSyncCoordinator` writes
+    /// via a fresh `ModelContext(container)`, so a manual
+    /// `context.fetch(...)` from the @Environment context could return
+    /// stale (empty) results until something explicitly invalidated.
+    /// @Query short-circuits all of that.
+    @Query private var allStores: [Store]
 
     private var storeNames: [String] {
-        storeService.distinctStoreNames(in: selectedArea)
+        var seen = Set<String>()
+        var result: [String] = []
+        for s in allStores where !s.store.isEmpty {
+            // If an area filter is requested, only include stores
+            // that either match the area OR have no area set
+            // (partial-migration safety).
+            if !selectedArea.isEmpty && !s.area.isEmpty && s.area != selectedArea {
+                continue
+            }
+            if !seen.contains(s.store) {
+                seen.insert(s.store)
+                result.append(s.store)
+            }
+        }
+        return result.sorted()
     }
 
     // Store numbers for the currently-selected chain, or empty when
     // no chain has been chosen yet. Sorted numerically when possible.
     private var availableNumbers: [String] {
         guard !draftStore.isEmpty else { return [] }
-        let raw = storeService.storeNumbers(for: draftStore, in: selectedArea)
-        return raw.sorted { lhs, rhs in
+        let matches = allStores.filter { $0.store == draftStore }
+        let scoped = matches.filter { s in
+            if selectedArea.isEmpty { return true }
+            if s.area.isEmpty { return true }
+            return s.area == selectedArea
+        }
+        return scoped.map(\.storeNumber).sorted { lhs, rhs in
             if let l = Int(lhs), let r = Int(rhs) { return l < r }
             return lhs.localizedStandardCompare(rhs) == .orderedAscending
         }
@@ -2719,20 +2744,21 @@ struct StorePickerView: View {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("No stores synced for \(selectedArea) yet.")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(headlineText)
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        // If the most recent sync attempt actually
-                        // came back failed (vs just never having run
-                        // because the launch sync was offline), show
-                        // the underlying error so the AM can tell
-                        // network from configuration trouble.
-                        if case let .failed(message) = storeCoordinator.state {
-                            Text(message)
+                        // After-sync detail: failure message (network /
+                        // server) OR a "synced N but none matched"
+                        // hint (configuration mismatch — most often
+                        // the AM picked an area string that doesn't
+                        // appear in stores.csv, e.g. "PNWSEATTLE"
+                        // vs "PNW Seattle").
+                        if let detail = detailText {
+                            Text(detail)
                                 .font(.caption2)
-                                .foregroundStyle(.red)
-                                .lineLimit(3)
+                                .foregroundStyle(detailIsError ? .red : .orange)
+                                .lineLimit(4)
                         }
                     }
                 }
@@ -2761,6 +2787,50 @@ struct StorePickerView: View {
             .background(Color(.secondarySystemBackground))
             .clipShape(RoundedRectangle(cornerRadius: 12))
         }
+    }
+
+    /// Headline above the recovery button. Adjusts to reflect what
+    /// just happened on the most recent sync attempt — "synced N but
+    /// none matched your area" is a meaningfully different state from
+    /// "haven't synced yet" or "syncing now."
+    private var headlineText: String {
+        switch storeCoordinator.state {
+        case .syncing:
+            return "Syncing stores for \(selectedArea)…"
+        case .succeeded(let count) where count > 0 && allStores.isEmpty:
+            // Should never hit this — the @Query is live — but keep
+            // the prose honest if it ever does.
+            return "Synced \(count) stores."
+        case .succeeded(let count) where count > 0:
+            return "Synced \(count) store\(count == 1 ? "" : "s"), but none match \"\(selectedArea)\"."
+        case .succeeded:
+            return "Sync ran but the stores file was empty."
+        case .failed:
+            return "Couldn't sync stores."
+        case .idle:
+            return "No stores synced for \(selectedArea) yet."
+        }
+    }
+
+    /// Secondary detail row under the headline — error message on
+    /// failure, area-mismatch hint after a partial-success sync,
+    /// nothing otherwise.
+    private var detailText: String? {
+        switch storeCoordinator.state {
+        case .failed(let message):
+            return message
+        case .succeeded(let count) where count > 0:
+            return "Check Settings → Area to make sure your area string matches the stores.csv exactly."
+        default:
+            return nil
+        }
+    }
+
+    /// Tints the detail line red on real errors, orange on
+    /// configuration hints. Plain caption styling otherwise.
+    private var detailIsError: Bool {
+        if case .failed = storeCoordinator.state { return true }
+        return false
     }
 
     /// True while the StoreSyncCoordinator is mid-fetch. Pulled out
