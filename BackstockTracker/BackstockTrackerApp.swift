@@ -34,6 +34,7 @@ import VisionKit
 import Vision
 import MessageUI
 import CloudKit
+import UIKit
 
 // MARK: - Theme
 
@@ -646,7 +647,7 @@ final class ScanSession {
     var statusRaw: String
     var notes: String?
     var storeNumber: String?
-    // Physical box this session is packed into — 1…10, picked on the
+    // Physical box this session is packed into — 1…20, picked on the
     // scan screen alongside store + store number. Optional so pre-box
     // sessions and "I forgot to pick" cases don't crash.
     var box: Int?
@@ -924,6 +925,81 @@ actor CloudSyncService {
 
     static let containerIdentifier = "iCloud.com.jacent.BackstockTracker"
     static let recordType = "BackstockSession"
+
+    // MARK: Chain-name corruption scrub
+    //
+    // One-shot read-side defensive scrub for a known data-corruption
+    // pattern. A previous catalog-generation step ran the substitution
+    // shortName → long-form storeName (e.g. "AS" → "Albertsons/Safeway")
+    // *globally* across the catalog text, so the full chain name leaked
+    // into any product/commodity that happened to contain the
+    // two-letter substring (PASTRY → PAlbertsons/SafewayTRY, SEASONAL
+    // → SEAlbertsons/SafewayONAL, etc.). The corrupted strings were
+    // baked into CloudKit records at scan time, so even after the
+    // upstream catalog is fixed, historical records still display the
+    // corruption.
+    //
+    // Strategy: build a reverse map of long-form chain name → shortName
+    // from the records' own storeName + the caller's shortNames lookup,
+    // then run `replacingOccurrences` of long → short on every
+    // CloudSyncItem's name + commodity. Chain headers in the area view
+    // keep the long form because they look it up directly from
+    // storeShortNames, not from item text.
+    //
+    // Lives on CloudSyncService so the same scrub can run at the
+    // primary entry point (StoreHistoryList.reload + the
+    // teamSessionDidUpdate listener) and any downstream defense-in-depth
+    // sites (AreaBackstockView).
+    //
+    // Safe in the current data shape because no legitimate product or
+    // commodity contains the literal long-form chain name. If that ever
+    // changes, this scrub should be retired in favor of fixing the
+    // upstream substitution.
+    nonisolated static func scrubChainCorruption(
+        _ records: [TeamBackstockRecord],
+        storeShortNames: [String: String]
+    ) -> [TeamBackstockRecord] {
+        // Collect (long, short) pairs once. Longest-first ordering so
+        // a chain name that's a prefix of another doesn't get
+        // half-replaced by the shorter entry first.
+        var pairs: [(long: String, short: String)] = []
+        var seen: Set<String> = []
+        for rec in records {
+            let long = rec.storeName
+            guard !long.isEmpty, !seen.contains(long) else { continue }
+            guard let short = storeShortNames[rec.storeNumber], !short.isEmpty else { continue }
+            pairs.append((long, short))
+            seen.insert(long)
+        }
+        pairs.sort { $0.long.count > $1.long.count }
+        guard !pairs.isEmpty else { return records }
+
+        func scrub(_ s: String) -> String {
+            var out = s
+            for p in pairs {
+                if out.contains(p.long) {
+                    out = out.replacingOccurrences(of: p.long, with: p.short)
+                }
+            }
+            return out
+        }
+
+        return records.map { rec in
+            var copy = rec
+            copy.items = rec.items.map { item in
+                CloudSyncItem(
+                    upc: item.upc,
+                    name: scrub(item.name),
+                    quantity: item.quantity,
+                    price: item.price,
+                    retailPrice: item.retailPrice,
+                    rank: item.rank,
+                    commodity: item.commodity.map(scrub)
+                )
+            }
+            return copy
+        }
+    }
 
     private let container: CKContainer
     private var database: CKDatabase { container.publicCloudDatabase }
@@ -1453,6 +1529,41 @@ final class PickListStore {
     /// of how many copies the AM had queued up.
     func removeAllFor(recordId: String, upc: String) {
         items.removeAll { $0.recordId == recordId && $0.upc == upc }
+        persist()
+    }
+
+    /// Cascade-delete path — called when an entire backstock record
+    /// is deleted (single-box swipe-delete or empty-boxes bulk
+    /// cleanup). Drops every pick-list entry that points at this
+    /// record, regardless of UPC, so stale picks don't orphan to a
+    /// recordId that no longer exists in CloudKit.
+    @discardableResult
+    func removeAllFor(recordId: String) -> Int {
+        let before = items.count
+        items.removeAll { $0.recordId == recordId }
+        let removed = before - items.count
+        if removed > 0 { persist() }
+        return removed
+    }
+
+    /// Snapshot every entry pointing at a given record. Used by
+    /// callers that need to optimistically clear those entries before
+    /// a network op and roll back on failure — pair with
+    /// `restore(_:)` to put the snapshot back.
+    func entries(forRecordId recordId: String) -> [PickListItem] {
+        items.filter { $0.recordId == recordId }
+    }
+
+    /// Re-append a previously-snapshotted set of entries. Idempotent
+    /// against the current array: entries whose id is already present
+    /// are skipped, so a double-restore (e.g. from racing UI handlers)
+    /// doesn't duplicate the rows.
+    func restore(_ snapshot: [PickListItem]) {
+        guard !snapshot.isEmpty else { return }
+        let existing = Set(items.map(\.id))
+        let additions = snapshot.filter { !existing.contains($0.id) }
+        guard !additions.isEmpty else { return }
+        items.append(contentsOf: additions)
         persist()
     }
 
@@ -3030,10 +3141,14 @@ struct RootTabView: View {
 private enum ScanSortOrder: String, CaseIterable {
     // Default. Merchandising rank from the catalog (lower is better);
     // items without a rank fall to the bottom of the list.
-    case rank      = "Rank"
-    case scanOrder = "Scan order"
-    case nameAZ    = "Name A→Z"
-    case nameZA    = "Name Z→A"
+    case rank          = "Rank"
+    case scanOrder     = "Scan order"
+    case nameAZ        = "Name A→Z"
+    case nameZA        = "Name Z→A"
+    // Highest-quantity-first. Answers "what do I have a lot of?" —
+    // useful when an AM is triaging a deep backstock to find the
+    // bulk-volume SKUs first. Ties broken by name asc for stability.
+    case quantityDesc  = "Quantity high→low"
     // Price sorts removed by request — they didn't map to any AM
     // workflow on the backstock surfaces (rank already conveys the
     // useful "what should I work first" signal). Re-add scoped to a
@@ -3108,7 +3223,7 @@ struct ScanView: View {
     // store-name and store-number pickers. LaunchCoordinator guarantees
     // this is non-empty before ScanView mounts.
     @AppStorage("selectedArea") private var selectedArea: String = ""
-    // Physical box number (1…10) the current session will be recorded
+    // Physical box number (1…20) the current session will be recorded
     // against. Stored in @AppStorage so the AM doesn't lose their box
     // if the app gets backgrounded mid-scan, but changes to it are
     // cheap — they can bump it for every new box through the day. 0
@@ -3415,10 +3530,10 @@ struct ScanView: View {
         let boxDisabled = scanInProgress
 
         return HStack(spacing: 10) {
-            // Box picker (1–10). Only disabled while a scan is in
+            // Box picker (1–20). Only disabled while a scan is in
             // progress so the box can't silently change mid-session.
             Menu {
-                ForEach(1...10, id: \.self) { n in
+                ForEach(1...20, id: \.self) { n in
                     Button {
                         selectedBox = n
                     } label: {
@@ -4006,10 +4121,10 @@ struct ScanView: View {
 
             // Advance to the next box number so the AM can keep scanning
             // the next physical box without having to reach for the
-            // picker. Cap at 10 (the max the picker offers) — if the AM
-            // actually has an 11th box, they'll bump it manually or
+            // picker. Cap at 20 (the max the picker offers) — if the AM
+            // actually has a 21st box, they'll bump it manually or
             // start a new day at Box 1.
-            if selectedBox >= 1 && selectedBox < 10 {
+            if selectedBox >= 1 && selectedBox < 20 {
                 selectedBox += 1
             }
 
@@ -4030,6 +4145,15 @@ struct ScanView: View {
                 )
                 if let payload {
                     Task {
+                        // Background-task assertion so iOS gives us a
+                        // few extra seconds to finish the CKModify op
+                        // if the AM locks the phone right after Submit.
+                        // Without it, an unstructured Task can be
+                        // suspended mid-upload and the session stays
+                        // cloudSyncedAt = nil until next launch's retry.
+                        let bgTask = UIApplication.shared.beginBackgroundTask(
+                            withName: "BackstockTracker.upload"
+                        )
                         do {
                             try await CloudSyncService.shared.upload(payload)
                             // Mark the local record synced so we don't
@@ -4060,10 +4184,18 @@ struct ScanView: View {
                                 )
                             }
                         } catch {
-                            // Swallow — cloudSyncedAt stays nil and the
-                            // next app launch's retry pass will try again.
+                            // Local SwiftData persist already succeeded,
+                            // so the AM's work isn't lost — the next-
+                            // launch retry sweep will reattempt. Surface
+                            // the failure in the standard scan error
+                            // banner so they know the team feed hasn't
+                            // received this box yet.
                             print("Cloud upload failed for \(session.id): \(error)")
+                            await MainActor.run {
+                                lastScanErrorMessage = "Saved on device — cloud upload failed. Will retry on next launch."
+                            }
                         }
+                        UIApplication.shared.endBackgroundTask(bgTask)
                     }
                 }
             }
@@ -4116,6 +4248,12 @@ struct ScanView: View {
         let box = store.editingRecordBox
 
         Task {
+            // Same bg-task assertion as submitNew — the AM may lock
+            // the phone right after tapping Save changes, and we want
+            // the CloudKit patch to finish rather than being suspended.
+            let bgTask = UIApplication.shared.beginBackgroundTask(
+                withName: "BackstockTracker.editUpload"
+            )
             do {
                 try await CloudSyncService.shared.updateItems(
                     sessionUUID: recordId,
@@ -4176,6 +4314,7 @@ struct ScanView: View {
                     lastScanErrorMessage = "Couldn't save changes: \(error.localizedDescription)"
                 }
             }
+            UIApplication.shared.endBackgroundTask(bgTask)
         }
     }
 
@@ -4513,6 +4652,12 @@ struct StoreHistoryList: View {
     let storeNumber: String
     let storeShortNames: [String: String]
 
+    // Pick-list access so the delete flows can cascade — any flagged
+    // items pointing at a record we just removed need to be wiped out
+    // of the pick list too, otherwise they orphan to a CloudKit id
+    // that no longer exists.
+    @Environment(PickListStore.self) private var pickList
+
     @State private var records: [TeamBackstockRecord] = []
     @State private var loadState: LoadState = .loading
     @State private var errorMessage: String?
@@ -4542,6 +4687,12 @@ struct StoreHistoryList: View {
     // that screen now (the "Backstock contents" page), where the
     // flat line-items list is the natural place to filter by UPC.
     @State private var showAllBackstock = false
+    // Sibling of showAllBackstock for the area-wide screen. The two
+    // buttons live side-by-side in the header zone — same data shape
+    // (TeamBackstockRecord), different scope and grouping. Hidden when
+    // there's only one store represented in `records`, since at that
+    // point the area view collapses into the per-store view's content.
+    @State private var showAreaBackstock = false
 
     // Drives the "Remove all empty boxes" confirmation dialog. An
     // empty box is a CloudKit record with `items.isEmpty` — usually
@@ -4598,6 +4749,18 @@ struct StoreHistoryList: View {
         sortedRecords.filter { $0.items.isEmpty }
     }
 
+    // True when the area-wide fetch contains records from more than
+    // one storeNumber. Drives whether the "View all stores in area"
+    // button appears — only meaningful for multi-store areas.
+    private var hasMultiStoreBackstock: Bool {
+        var seen: Set<String> = []
+        for r in records where !r.items.isEmpty {
+            seen.insert(r.storeNumber)
+            if seen.count > 1 { return true }
+        }
+        return false
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // "View all backstock" header button. Sits flush below the
@@ -4616,6 +4779,38 @@ struct StoreHistoryList: View {
                     HStack(spacing: 10) {
                         Image(systemName: "list.bullet.rectangle")
                         Text("View all backstock contents")
+                            .fontWeight(.semibold)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .frame(maxWidth: .infinity)
+                    .background(Color(.secondarySystemGroupedBackground))
+                }
+                .foregroundStyle(.tint)
+                .buttonStyle(.plain)
+                .overlay(alignment: .bottom) {
+                    Divider()
+                }
+            }
+
+            // Sibling button for the area-wide view. Only shown when
+            // there's actually backstock at more than one store in the
+            // area — otherwise the area view degenerates into the
+            // per-store view's content and the second button is just
+            // noise. `records` here is the unfiltered area-wide fetch
+            // (filteredRecords narrows to selectedStoreNumber for this
+            // screen's per-box list).
+            if hasMultiStoreBackstock {
+                Button {
+                    showAreaBackstock = true
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "building.2")
+                        Text("View all stores in \(area)")
                             .fontWeight(.semibold)
                         Spacer()
                         Image(systemName: "chevron.right")
@@ -4755,6 +4950,17 @@ struct StoreHistoryList: View {
                 records: sortedRecords,
                 storeShortNames: storeShortNames,
                 storeNumber: storeNumber
+            )
+        }
+        // Area-wide sibling. Hands the unfiltered records array
+        // (every store in the area) so the new screen can group by
+        // store. Same .teamSessionDidUpdate listener pattern keeps
+        // both screens in sync without a re-fetch.
+        .navigationDestination(isPresented: $showAreaBackstock) {
+            AreaBackstockView(
+                records: records,
+                storeShortNames: storeShortNames,
+                area: area
             )
         }
         // Reload whenever either the area OR the scoped store changes
@@ -4911,7 +5117,14 @@ struct StoreHistoryList: View {
             let fetched = try await CloudSyncService.shared.fetchAllMerged(
                 area: area.isEmpty ? nil : area
             )
-            records = fetched
+            // Strip the known catalog-corruption pattern (long-form
+            // chain names embedded in product / commodity strings —
+            // see CloudSyncService.scrubChainCorruption) at the single
+            // entry point for fetched records, so every downstream
+            // consumer (this list, AllBackstockDetailView,
+            // AreaBackstockView, TeamSessionDetailView) sees clean
+            // text without each having to scrub independently.
+            records = CloudSyncService.scrubChainCorruption(fetched, storeShortNames: storeShortNames)
             loadState = .loaded
         } catch {
             errorMessage = error.localizedDescription
@@ -4933,10 +5146,18 @@ struct StoreHistoryList: View {
             // depth. In practice an AM only ever sees their own
             // area, but a stale notification shouldn't pollute.
             guard area.isEmpty || record.area == area else { return }
-            if let idx = records.firstIndex(where: { $0.id == record.id }) {
-                records[idx] = record
+            // Scrub the incoming record so a freshly-pushed item
+            // (PickListSheet "Remove from backstock", per-box edit)
+            // doesn't re-introduce the chain-name corruption that
+            // reload() already strips out. See CloudSyncService
+            // .scrubChainCorruption.
+            let cleaned = CloudSyncService.scrubChainCorruption(
+                [record], storeShortNames: storeShortNames
+            ).first ?? record
+            if let idx = records.firstIndex(where: { $0.id == cleaned.id }) {
+                records[idx] = cleaned
             } else {
-                records.append(record)
+                records.append(cleaned)
             }
             // If this is the very first submission (list was empty
             // / loading / failed), flip to .loaded so the row
@@ -4969,6 +5190,15 @@ struct StoreHistoryList: View {
         if let idx = originalIndex {
             records.remove(at: idx)
         }
+        // Optimistically drop pick-list entries for this record so
+        // they disappear from PickListSheet instantly rather than
+        // hanging around through the 1-3s CloudKit round-trip. We
+        // snapshot them first so the catch branch can restore them
+        // if the delete actually fails (auth, network, etc.).
+        let pickSnapshot = pickList.entries(forRecordId: record.id)
+        if !pickSnapshot.isEmpty {
+            pickList.removeAllFor(recordId: record.id)
+        }
         do {
             try await CloudSyncService.shared.delete(sessionUUID: record.id)
         } catch {
@@ -4979,6 +5209,9 @@ struct StoreHistoryList: View {
             } else {
                 records.append(record)
             }
+            // Restore the picks too — the box is back, so the AM
+            // still needs to pull these items.
+            pickList.restore(pickSnapshot)
             deleteErrorMessage = error.localizedDescription
         }
     }
@@ -5002,6 +5235,17 @@ struct StoreHistoryList: View {
         let targetIds = Set(targets.map(\.id))
         records.removeAll { targetIds.contains($0.id) }
 
+        // Snapshot picks per record up front so we can restore on
+        // failure. Empty boxes typically have no picks, so this is
+        // usually a no-op, but keep the path symmetric with
+        // performDelete for predictability.
+        let pickSnapshots: [String: [PickListItem]] = Dictionary(
+            uniqueKeysWithValues: targets.map { ($0.id, pickList.entries(forRecordId: $0.id)) }
+        )
+        for (id, snapshot) in pickSnapshots where !snapshot.isEmpty {
+            pickList.removeAllFor(recordId: id)
+        }
+
         var failed: [TeamBackstockRecord] = []
         var firstError: String?
         for record in targets {
@@ -5011,6 +5255,12 @@ struct StoreHistoryList: View {
                 failed.append(record)
                 if firstError == nil {
                     firstError = error.localizedDescription
+                }
+                // Failed delete → its picks were optimistically
+                // wiped, restore them so the AM doesn't lose a queue
+                // because of a transient network issue.
+                if let snap = pickSnapshots[record.id] {
+                    pickList.restore(snap)
                 }
             }
         }
@@ -5090,6 +5340,18 @@ struct StoreHistoryList: View {
         }
         records.removeAll { $0.id == merge.source.id }
 
+        // Optimistic pick-list cascade for the source record. Same
+        // rationale as performDelete: we don't re-point picks to the
+        // target because the merged-into box has a different box
+        // number, and the picked-unit's .box label would no longer
+        // match what's on screen. The PickListSheet's orphan-skip
+        // path already protects against the rare race where a pick
+        // is left dangling.
+        let pickSnapshot = pickList.entries(forRecordId: merge.source.id)
+        if !pickSnapshot.isEmpty {
+            pickList.removeAllFor(recordId: merge.source.id)
+        }
+
         do {
             try await CloudSyncService.shared.updateItems(
                 sessionUUID: merge.target.id,
@@ -5103,6 +5365,9 @@ struct StoreHistoryList: View {
             NotificationCenter.default.post(name: .teamSessionDidUpdate, object: merge.target.id)
         } catch {
             records = snapshot
+            // Restore source picks — the merge didn't actually go
+            // through, so the source box and its picks still apply.
+            pickList.restore(pickSnapshot)
             mergeErrorMessage = error.localizedDescription
         }
     }
@@ -5123,12 +5388,12 @@ struct StoreHistoryList: View {
     // `.contextMenu { … }` for the same type-checker reason as
     // exportMenuContents — keeping it inline pushes the row builder
     // past the SwiftUI complexity budget. Has two sections:
-    //   • "Change Box #" submenu (1–10, current box disabled)
+    //   • "Change Box #" submenu (1–20, current box disabled)
     //   • "Merge {this box} into…" with a button per other box
     @ViewBuilder
     private func rowContextMenu(record: TeamBackstockRecord) -> some View {
         Menu {
-            ForEach(1...10, id: \.self) { box in
+            ForEach(1...20, id: \.self) { box in
                 Button("Box \(box)") {
                     Task { await performBoxChange(record: record, newBox: box) }
                 }
@@ -5570,6 +5835,11 @@ struct TeamSessionDetailView: View {
             return filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         case .nameZA:
             return filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedDescending }
+        case .quantityDesc:
+            return filtered.sorted { a, b in
+                if a.quantity != b.quantity { return a.quantity > b.quantity }
+                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            }
         }
     }
 
@@ -6272,15 +6542,20 @@ struct AllBackstockDetailView: View {
     }
 
     @State private var sortOrder: ScanSortOrder = .rank
-    // Unified find-an-item search. Substring match across UPC, item
-    // name, and commodity in one field — replaces the previous
-    // commodity / name pair. Single field is enough because almost
-    // every "where is X?" query is naturally one of those three, and
-    // the AM doesn't have to think about which box to type into.
-    // Pre-fillable from a barcode scan via the toolbar scan button
-    // (see showScanner / fullScreenCover below).
+    // Find-an-item search. Substring match across UPC + item name in
+    // one field. Commodity is a separate dropdown filter (see
+    // selectedCommodity below) so AMs can pick from a known list of
+    // categories instead of guessing the spelling. Pre-fillable from
+    // a barcode scan via the toolbar scan button (see showScanner /
+    // fullScreenCover below).
     @State private var searchText: String = ""
     @State private var showScanner: Bool = false
+
+    // Exact-match commodity filter. nil = no filter ("All commodities").
+    // Populated from a Menu of distinct commodities present in the
+    // currently visible records. Distinct from searchText so an AM
+    // can narrow to a category and then type a partial name within it.
+    @State private var selectedCommodity: String?
 
     // Export-all sheets. Shared CSV-on-disk goes through ShareURL
     // (Quick Look / share sheet), and the email path uses the same
@@ -6323,9 +6598,55 @@ struct AllBackstockDetailView: View {
     // preserve that order in the flatten step so .scanOrder reads
     // box-by-box top-to-bottom — a sensible "natural" order when no
     // explicit sort is selected.
+    //
+    // Items are aggregated by (recordId, upc, price) before display:
+    // if a record happens to contain multiple identical entries for
+    // the same UPC (an unusual data shape — the scan flow normally
+    // increments quantity rather than appending a new row, but a
+    // manual edit or import quirk can produce duplicates), we collapse
+    // them into one visible row with summed quantity. Without this,
+    // the bookmark visual (keyed by (recordId, upc)) lights up on
+    // every duplicate row when only one entry is queued, even though
+    // a single bookmark tap really did only enqueue one — confusing
+    // because every row looks flagged. Including `price` in the key
+    // keeps legitimately-separate rows (e.g. a manual-override row at
+    // a custom price) from getting merged with their catalog-priced
+    // siblings.
     private var allItems: [FlatItem] {
-        records.flatMap { rec in
-            rec.items.map { FlatItem(item: $0, box: rec.box, recordId: rec.id) }
+        struct Key: Hashable {
+            let recordId: String
+            let upc: String
+            let priceCents: Int
+        }
+        var groups: [Key: (item: CloudSyncItem, box: Int?, recordId: String)] = [:]
+        var order: [Key] = []
+        for rec in records {
+            for item in rec.items {
+                let key = Key(
+                    recordId: rec.id,
+                    upc: item.upc,
+                    priceCents: Int((item.price * 100).rounded())
+                )
+                if let existing = groups[key] {
+                    let merged = CloudSyncItem(
+                        upc: existing.item.upc,
+                        name: existing.item.name,
+                        quantity: existing.item.quantity + item.quantity,
+                        price: existing.item.price,
+                        retailPrice: existing.item.retailPrice,
+                        rank: existing.item.rank,
+                        commodity: existing.item.commodity
+                    )
+                    groups[key] = (merged, existing.box, existing.recordId)
+                } else {
+                    groups[key] = (item, rec.box, rec.id)
+                    order.append(key)
+                }
+            }
+        }
+        return order.map { key in
+            let g = groups[key]!
+            return FlatItem(item: g.item, box: g.box, recordId: g.recordId)
         }
     }
 
@@ -6346,16 +6667,25 @@ struct AllBackstockDetailView: View {
     }
 
     private var isFiltered: Bool {
-        sortOrder != .rank || !trimmedSearch.isEmpty
+        sortOrder != .rank || !trimmedSearch.isEmpty || selectedCommodity != nil
+    }
+
+    // Distinct commodities across all currently-visible items, sorted
+    // alphabetically for the dropdown. Empty/nil commodities are
+    // dropped — they're surfaced via the "All commodities" default
+    // rather than as a separate option.
+    private var availableCommodities: [String] {
+        let raw = allItems.compactMap { $0.item.commodity }
+            .filter { !$0.isEmpty }
+        return Array(Set(raw)).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
 
     // Mirrors TeamSessionDetailView.displayedItems — same sort modes —
     // so AMs jumping between the two views see consistent behavior.
     // .scanOrder here means "natural" (box-asc, then within-box
     // order). The search field runs a single substring match across
-    // UPC, name, and commodity (OR-ed), so typing a UPC narrows by
-    // UPC, typing "shopping bag" narrows by name, and typing "TOYS"
-    // narrows by commodity — all in one field.
+    // UPC + name; commodity is filtered separately via the dropdown
+    // chip below the search bar (selectedCommodity).
     //
     // The UPC branch strips leading zeros from BOTH sides before
     // comparing — the scanner often returns 13-digit codes
@@ -6366,16 +6696,16 @@ struct AllBackstockDetailView: View {
     // CatalogService.upcCandidates.
     private func displayedItems() -> [FlatItem] {
         var filtered = allItems
+        if let selectedCommodity, !selectedCommodity.isEmpty {
+            filtered = filtered.filter { ($0.item.commodity ?? "") == selectedCommodity }
+        }
         let q = trimmedSearch.lowercased()
         if !q.isEmpty {
             let qUPC = Self.stripLeadingZeros(q)
             filtered = filtered.filter { flat in
                 let itemUPC = Self.stripLeadingZeros(flat.item.upc.lowercased())
                 let name = flat.item.name.lowercased()
-                let commodity = (flat.item.commodity ?? "").lowercased()
-                return itemUPC.contains(qUPC)
-                    || name.contains(q)
-                    || commodity.contains(q)
+                return itemUPC.contains(qUPC) || name.contains(q)
             }
         }
         switch sortOrder {
@@ -6387,6 +6717,11 @@ struct AllBackstockDetailView: View {
             return filtered.sorted { $0.item.name.localizedCaseInsensitiveCompare($1.item.name) == .orderedAscending }
         case .nameZA:
             return filtered.sorted { $0.item.name.localizedCaseInsensitiveCompare($1.item.name) == .orderedDescending }
+        case .quantityDesc:
+            return filtered.sorted { a, b in
+                if a.item.quantity != b.item.quantity { return a.item.quantity > b.item.quantity }
+                return a.item.name.localizedCaseInsensitiveCompare(b.item.name) == .orderedAscending
+            }
         }
     }
 
@@ -6776,17 +7111,19 @@ struct AllBackstockDetailView: View {
             .padding(.top, 20)
             .padding(.bottom, 4)
 
-            // Unified find-an-item bar — substring-matches the typed
-            // text against UPC, name, AND commodity in one shot. The
-            // trailing barcode button opens the same CameraScannerView
-            // the scan flow uses; on a successful detection the UPC
+            // Find-an-item bar — substring-matches the typed text
+            // against UPC + name. Commodity is a separate dropdown
+            // (commodityFilterChip below) so AMs can pick a category
+            // exactly instead of guessing the spelling. The trailing
+            // barcode button opens the same CameraScannerView the
+            // scan flow uses; on a successful detection the UPC
             // pre-fills `searchText` and the scanner dismisses, so the
             // AM lands back here with the list already narrowed.
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(Color.accentColor)
                     .font(.caption)
-                TextField("Search by UPC, name, or commodity", text: $searchText)
+                TextField("Search by UPC or name", text: $searchText)
                     .font(.subheadline)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -6826,6 +7163,8 @@ struct AllBackstockDetailView: View {
             }
             .padding(.bottom, 8)
 
+            commodityFilterChip
+
             VStack(spacing: 0) {
                 ForEach(Array(sorted.enumerated()), id: \.offset) { idx, flat in
                     flatItemRow(flat: flat)
@@ -6835,6 +7174,77 @@ struct AllBackstockDetailView: View {
                 }
             }
             .background(Color(.systemBackground))
+        }
+    }
+
+    // Commodity dropdown chip — sits between the search bar and the
+    // line-items list. Hidden entirely when no item in the visible set
+    // has a commodity (older records pre-commodity, or a single-box
+    // view where everything is in the same category). The chip's
+    // background goes accent-tinted when a filter is active so it's
+    // visually obvious the list is narrowed.
+    @ViewBuilder
+    private var commodityFilterChip: some View {
+        let commodities = availableCommodities
+        if !commodities.isEmpty {
+            HStack(spacing: 8) {
+                Menu {
+                    Button {
+                        selectedCommodity = nil
+                    } label: {
+                        if selectedCommodity == nil {
+                            Label("All commodities", systemImage: "checkmark")
+                        } else {
+                            Text("All commodities")
+                        }
+                    }
+                    Divider()
+                    ForEach(commodities, id: \.self) { commodity in
+                        Button {
+                            selectedCommodity = commodity
+                        } label: {
+                            if selectedCommodity == commodity {
+                                Label(commodity, systemImage: "checkmark")
+                            } else {
+                                Text(commodity)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "tag")
+                            .font(.caption)
+                        Text(selectedCommodity ?? "All commodities")
+                            .font(.caption.weight(.medium))
+                            .lineLimit(1)
+                        Image(systemName: "chevron.down")
+                            .font(.caption2)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(
+                        selectedCommodity != nil
+                        ? Color.accentColor.opacity(0.20)
+                        : Color.accentColor.opacity(0.08)
+                    )
+                    .foregroundStyle(Color.accentColor)
+                    .clipShape(Capsule())
+                }
+                if selectedCommodity != nil {
+                    Button {
+                        selectedCommodity = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                            .font(.subheadline)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear commodity filter")
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 8)
         }
     }
 
@@ -7037,6 +7447,875 @@ struct AllBackstockDetailView: View {
     }
 }
 
+// MARK: - Area-wide backstock view
+//
+// AllBackstockDetailView's multi-store sibling. Same data shape (a slice
+// of TeamBackstockRecord), same filter primitives (search + commodity +
+// pick-list integration), but the records are NOT pre-narrowed to one
+// store and the layout groups by store first, then by box within each
+// store. Used when the AM wants to know "which store in my area has the
+// dairy backstock?" or "where in the area can I find UPC X?"
+//
+// Mounted as a navigation destination from StoreHistoryList; receives
+// the entire area-wide records array StoreHistoryList already has on
+// hand (CloudKit fetches by area, then the per-store list filters
+// client-side — see comment at filteredRecords). No extra network call.
+struct AreaBackstockView: View {
+    // @State so .teamSessionDidUpdate userInfo can patch the visible
+    // records in place (bookmark removal flow, in particular).
+    @State private var records: [TeamBackstockRecord]
+    let storeShortNames: [String: String]
+    let area: String
+
+    init(records: [TeamBackstockRecord], storeShortNames: [String: String], area: String) {
+        // Defense-in-depth: apply the chain-name scrub at init even
+        // though StoreHistoryList already scrubs its records array
+        // before we get here. The contains() check inside the scrub
+        // short-circuits to ~O(n) when there's nothing to replace, so
+        // running it twice on clean data is a no-op cost-wise.
+        _records = State(initialValue: CloudSyncService.scrubChainCorruption(records, storeShortNames: storeShortNames))
+        self.storeShortNames = storeShortNames
+        self.area = area
+    }
+
+    @State private var searchText: String = ""
+    @State private var selectedCommodity: String?
+    // Collapse state — track *expanded* chains rather than collapsed
+    // ones so the default empty set means "everything closed." That
+    // matches the user-requested default and avoids needing to seed
+    // this set off the visible chain list on first render. When a
+    // search / commodity / store filter is active we override this and
+    // auto-expand every visible chain — the AM has already narrowed
+    // the view, so making them tap into each chain to see hits would
+    // defeat the purpose. Keyed by chain name (long-form storeName).
+    @State private var expandedChains: Set<String> = []
+    // Independent collapse state for each individual location
+    // (storeNumber). Allows the AM to drill into a specific store
+    // within an expanded chain without seeing every other store's
+    // boxes. Same default-empty-means-collapsed semantics as
+    // expandedChains. The two sets are independent, so a chain's
+    // expansion doesn't auto-expand its locations — the AM gets a
+    // tidy list of location sub-headers and chooses which to drill
+    // into. Filter override (isFiltered) expands both layers.
+    @State private var expandedLocations: Set<String> = []
+
+    // No pick-list integration on this screen at all — neither the
+    // toolbar badge nor per-row flag controls. Area view is a pure
+    // read-only "where is what" lookup; pick-list management lives
+    // on the per-store screen.
+
+    // Bucket of items belonging to one box at one store, after filters.
+    // Stored as a struct rather than mutating TeamBackstockRecord so the
+    // upstream cache stays clean.
+    struct BoxBucket: Identifiable {
+        let recordId: String
+        let box: Int?
+        let items: [CloudSyncItem]
+        let storeName: String
+        let storeNumber: String
+        var id: String { recordId }
+    }
+
+    // One physical store location (a single storeNumber). Box buckets
+    // within are sorted box-asc, matching the per-store screen's
+    // walk-the-aisle convention. Multiple LocationGroups can roll up
+    // under a single ChainGroup when a chain has multiple stores in
+    // the area (e.g. two Fred Meyer locations).
+    struct LocationGroup: Identifiable {
+        let storeNumber: String
+        let buckets: [BoxBucket]
+        let subtotal: Double
+        let retailTotal: Double
+        let lineCount: Int
+        var boxCount: Int { buckets.count }
+        var id: String { storeNumber }
+    }
+
+    // Top-level grouping by chain (long-form storeName). Single-store
+    // chains still get a ChainGroup with one LocationGroup inside;
+    // keeps the rendering uniform. The chain header is the only
+    // collapsible level — tapping it toggles every location + box +
+    // item underneath.
+    struct ChainGroup: Identifiable {
+        let chainName: String
+        let locations: [LocationGroup]
+        let subtotal: Double
+        let retailTotal: Double
+        let lineCount: Int
+        var locationCount: Int { locations.count }
+        var boxCount: Int { locations.reduce(0) { $0 + $1.boxCount } }
+        var id: String { chainName }
+    }
+
+    private var trimmedSearch: String {
+        searchText.trimmingCharacters(in: .whitespaces)
+    }
+
+    private var isFiltered: Bool {
+        !trimmedSearch.isEmpty || selectedCommodity != nil
+    }
+
+    // Distinct commodities across the unfiltered area-wide set. Stable
+    // across store/search filter changes so toggling filters doesn't
+    // cause the dropdown options to flicker.
+    private var availableCommodities: [String] {
+        var set: Set<String> = []
+        for rec in records {
+            for it in rec.items {
+                if let c = it.commodity, !c.isEmpty { set.insert(c) }
+            }
+        }
+        return set.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    // Per-record item filter — applies the active commodity + search to
+    // a single items array. Returns the items unchanged when no filter
+    // is active. Same UPC-leading-zero normalization as
+    // AllBackstockDetailView so 12/13-digit scanner mismatches still hit.
+    private func filterItems(_ items: [CloudSyncItem]) -> [CloudSyncItem] {
+        var out = items
+        if let sc = selectedCommodity, !sc.isEmpty {
+            out = out.filter { ($0.commodity ?? "") == sc }
+        }
+        let q = trimmedSearch.lowercased()
+        if !q.isEmpty {
+            let qUPC = Self.stripLeadingZeros(q)
+            out = out.filter { item in
+                let itemUPC = Self.stripLeadingZeros(item.upc.lowercased())
+                return itemUPC.contains(qUPC) || item.name.lowercased().contains(q)
+            }
+        }
+        return out
+    }
+
+    private static func stripLeadingZeros(_ s: String) -> String {
+        guard !s.isEmpty, s.allSatisfy({ $0.isNumber }) else { return s }
+        let stripped = String(s.drop(while: { $0 == "0" }))
+        return stripped.isEmpty ? s : stripped
+    }
+
+    // Build the visible structure. Order of operations:
+    //   1. Filter items within each record by commodity + search.
+    //   2. Drop boxes whose items are entirely filtered out — an empty
+    //      box on the area screen is just noise.
+    //   3. Group surviving boxes by storeNumber → LocationGroup.
+    //   4. Roll those LocationGroups up by chain (long-form storeName)
+    //      → ChainGroup. Two Fred Meyer stores in the same area land
+    //      under one "Fred Meyer" header.
+    //   5. Sort chains alphabetically; sort locations within each chain
+    //      by storeNumber.
+    private var visibleChainGroups: [ChainGroup] {
+        let bucketed: [BoxBucket] = records.compactMap { rec in
+            let kept = filterItems(rec.items)
+            guard !kept.isEmpty else { return nil }
+            return BoxBucket(
+                recordId: rec.id,
+                box: rec.box,
+                items: kept,
+                storeName: rec.storeName,
+                storeNumber: rec.storeNumber
+            )
+        }
+
+        // Step 1: bucket → LocationGroup, keyed by storeNumber.
+        let byStoreNumber = Dictionary(grouping: bucketed) { $0.storeNumber }
+        let locationGroups: [LocationGroup] = byStoreNumber.compactMap { (storeNumber, buckets) in
+            let sortedBuckets = buckets.sorted { ($0.box ?? .max) < ($1.box ?? .max) }
+            guard !sortedBuckets.isEmpty else { return nil }
+            let subtotal = sortedBuckets.reduce(0.0) { acc, b in
+                acc + b.items.reduce(0.0) { $0 + $1.price * Double($1.quantity) }
+            }
+            let retail = sortedBuckets.reduce(0.0) { acc, b in
+                acc + b.items.reduce(0.0) { $0 + ($1.retailPrice ?? 0) * Double($1.quantity) }
+            }
+            let lines = sortedBuckets.reduce(0) { $0 + $1.items.count }
+            return LocationGroup(
+                storeNumber: storeNumber,
+                buckets: sortedBuckets,
+                subtotal: subtotal,
+                retailTotal: retail,
+                lineCount: lines
+            )
+        }
+
+        // Step 2: LocationGroup → ChainGroup, keyed by long-form
+        // storeName. We resolve the chain name from the record's
+        // storeName field (set at submit time from Store.store, which
+        // is the long form). Empty / missing storeName falls back to
+        // the shortName lookup, then to the storeNumber as last resort
+        // — that way a malformed record doesn't get silently merged
+        // with another empty-named record.
+        let pairs: [(LocationGroup, String)] = locationGroups.map { loc in
+            let chainName = loc.buckets.first?.storeName.nilIfEmpty
+                ?? storeShortNames[loc.storeNumber]
+                ?? "Store #\(loc.storeNumber)"
+            return (loc, chainName)
+        }
+        let byChain = Dictionary(grouping: pairs) { $0.1 }
+        let chainGroups: [ChainGroup] = byChain.compactMap { (chainName, pairs) in
+            let locations = pairs.map { $0.0 }
+                .sorted { $0.storeNumber < $1.storeNumber }
+            guard !locations.isEmpty else { return nil }
+            let subtotal = locations.reduce(0.0) { $0 + $1.subtotal }
+            let retail = locations.reduce(0.0) { $0 + $1.retailTotal }
+            let lines = locations.reduce(0) { $0 + $1.lineCount }
+            return ChainGroup(
+                chainName: chainName,
+                locations: locations,
+                subtotal: subtotal,
+                retailTotal: retail,
+                lineCount: lines
+            )
+        }
+        .sorted { $0.chainName.localizedCaseInsensitiveCompare($1.chainName) == .orderedAscending }
+
+        return chainGroups
+    }
+
+    private var grandTotal: Double {
+        visibleChainGroups.reduce(0.0) { $0 + $1.subtotal }
+    }
+
+    private var grandRetail: Double {
+        visibleChainGroups.reduce(0.0) { $0 + $1.retailTotal }
+    }
+
+    private var totalLineCount: Int {
+        visibleChainGroups.reduce(0) { $0 + $1.lineCount }
+    }
+
+    private var totalBoxCount: Int {
+        visibleChainGroups.reduce(0) { $0 + $1.boxCount }
+    }
+
+    private var totalLocationCount: Int {
+        visibleChainGroups.reduce(0) { $0 + $1.locationCount }
+    }
+
+    // For the "X of Y" caption when filtered: total unfiltered line
+    // count across the entire area, regardless of selected store.
+    private var unfilteredLineCount: Int {
+        records.reduce(0) { $0 + $1.items.count }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                header
+                searchBar
+                filterChips
+                if visibleChainGroups.isEmpty {
+                    emptyState
+                } else {
+                    chainSections
+                    totals
+                }
+            }
+            .padding(.bottom, 40)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("All stores")
+        .navigationBarTitleDisplayMode(.inline)
+        // Per-record patch propagation — same listener as
+        // AllBackstockDetailView, so a "Remove from backstock"
+        // initiated from the pick-list sheet immediately reflects on
+        // this screen too.
+        .onReceive(NotificationCenter.default.publisher(for: .teamSessionDidUpdate)) { note in
+            guard let updated = note.userInfo?["record"] as? TeamBackstockRecord else { return }
+            // Run the incoming record through the same chain-corruption
+            // scrub the initial records went through. Without this, a
+            // freshly-pushed record (e.g. from PickListSheet "Remove
+            // from backstock") would re-introduce the corruption into
+            // the visible state.
+            let cleaned = CloudSyncService.scrubChainCorruption([updated], storeShortNames: storeShortNames).first ?? updated
+            if let idx = records.firstIndex(where: { $0.id == cleaned.id }) {
+                if cleaned.items.isEmpty {
+                    records.remove(at: idx)
+                } else {
+                    records[idx] = cleaned
+                }
+            }
+        }
+    }
+
+    private var header: some View {
+        DetailHeaderView(
+            primaryAmount: currency(grandTotal),
+            secondaryDate: nil,
+            storeNumber: "",
+            storeName: area,
+            useNameAsHeadline: true,
+            sublines: [
+                "\(totalLocationCount) store\(totalLocationCount == 1 ? "" : "s") · \(totalBoxCount) box\(totalBoxCount == 1 ? "" : "es")"
+            ],
+            tinted: true,
+            compact: true
+        )
+    }
+
+    private var searchBar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Line items across area")
+                    .font(.caption).fontWeight(.medium)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if isFiltered {
+                    Text("\(totalLineCount) of \(unfilteredLineCount)")
+                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                } else {
+                    Text("\(totalLineCount) line\(totalLineCount == 1 ? "" : "s")")
+                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 4)
+
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(Color.accentColor)
+                    .font(.caption)
+                TextField("Search by UPC or name", text: $searchText)
+                    .font(.subheadline)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.search)
+                if !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                // No barcode-scan button on this screen — area view is
+                // read-only browse, not a scan surface. AMs scan from
+                // the per-store screen where the catalog is in scope.
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity)
+            .background(Color.accentColor.opacity(0.08))
+            .overlay(alignment: .top) {
+                Rectangle().fill(Color.accentColor.opacity(0.30)).frame(height: 0.5)
+            }
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(Color.accentColor.opacity(0.30)).frame(height: 0.5)
+            }
+            .padding(.bottom, 8)
+        }
+    }
+
+    // Commodity chip lives alone here — the per-store filter chip was
+    // removed once the chain/location grouping made it redundant: AMs
+    // can scope to a specific store by tapping its chain header
+    // instead of routing through the chip.
+    @ViewBuilder
+    private var filterChips: some View {
+        let commodities = availableCommodities
+        if !commodities.isEmpty {
+            HStack(spacing: 8) {
+                commodityChip(commodities: commodities)
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 8)
+        }
+    }
+
+    private func commodityChip(commodities: [String]) -> some View {
+        HStack(spacing: 4) {
+            Menu {
+                Button {
+                    selectedCommodity = nil
+                } label: {
+                    if selectedCommodity == nil {
+                        Label("All commodities", systemImage: "checkmark")
+                    } else {
+                        Text("All commodities")
+                    }
+                }
+                Divider()
+                ForEach(commodities, id: \.self) { commodity in
+                    Button {
+                        selectedCommodity = commodity
+                    } label: {
+                        if selectedCommodity == commodity {
+                            Label(commodity, systemImage: "checkmark")
+                        } else {
+                            Text(commodity)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "tag")
+                        .font(.caption)
+                    Text(selectedCommodity ?? "All commodities")
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(
+                    selectedCommodity != nil
+                    ? Color.accentColor.opacity(0.20)
+                    : Color.accentColor.opacity(0.08)
+                )
+                .foregroundStyle(Color.accentColor)
+                .clipShape(Capsule())
+            }
+            if selectedCommodity != nil {
+                Button {
+                    selectedCommodity = nil
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .font(.subheadline)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear commodity filter")
+            }
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            if records.isEmpty {
+                Image(systemName: "tray")
+                    .font(.system(size: 36))
+                    .foregroundStyle(.secondary)
+                Text("No backstock yet in \(area)")
+                    .font(.headline)
+                Text("Submitted boxes from any store in this area will appear here.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            } else {
+                Image(systemName: "line.3.horizontal.decrease.circle")
+                    .font(.system(size: 36))
+                    .foregroundStyle(.secondary)
+                Text("No matches")
+                    .font(.headline)
+                Button("Clear filters") {
+                    searchText = ""
+                    selectedCommodity = nil
+                }
+                .font(.subheadline)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 60)
+    }
+
+    // Top-level chain sections. Each header is a single tap target
+    // that expands the entire chain (every location + box + item
+    // underneath). Single-store chains still get the same chrome —
+    // it's just one location group inside.
+    private var chainSections: some View {
+        VStack(spacing: 0) {
+            ForEach(visibleChainGroups) { chain in
+                chainSection(chain: chain)
+                    .padding(.bottom, 12)
+            }
+        }
+    }
+
+    private func chainSection(chain: ChainGroup) -> some View {
+        let expanded = isExpanded(chain)
+        return VStack(spacing: 0) {
+            // Chain header — long-form name (truncated to one line so
+            // a "Albertsons / Safeway" or similar long chain string
+            // doesn't push the subtotal off the right edge), with a
+            // subline summarizing the chain's footprint in this area.
+            Button {
+                toggleExpansion(chain)
+            } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(chain.chainName)
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Text(chainSubline(chain))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 8)
+                    Text(currency(chain.subtotal))
+                        .font(.headline)
+                        .foregroundStyle(Color.accentColor)
+                        .monospacedDigit()
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+                .background(Color.accentColor.opacity(0.10))
+                .overlay(alignment: .top) {
+                    Rectangle().fill(Color.accentColor.opacity(0.35)).frame(height: 0.5)
+                }
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(Color.accentColor.opacity(0.35)).frame(height: 0.5)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(chain.chainName), \(chainSubline(chain)), \(currency(chain.subtotal))")
+            .accessibilityHint(expanded ? "Tap to collapse" : "Tap to expand")
+            .accessibilityAddTraits(.isButton)
+
+            // Expanded body — every location, every box, every item
+            // under this chain. Conditionally mounted so collapsed
+            // chains carry no view-tree weight (areas may have a dozen
+            // chains, each with multiple stores and many items).
+            if expanded {
+                VStack(spacing: 0) {
+                    ForEach(Array(chain.locations.enumerated()), id: \.element.id) { idx, location in
+                        if idx > 0 {
+                            // Divider between locations within the
+                            // same chain — heavier than the inter-box
+                            // divider so the grouping is visible.
+                            Rectangle()
+                                .fill(Color(.separator))
+                                .frame(height: 0.5)
+                                .padding(.vertical, 4)
+                        }
+                        locationBlock(location: location, chainName: chain.chainName)
+                    }
+                }
+                .background(Color(.systemBackground))
+                .transition(.asymmetric(
+                    insertion: .move(edge: .top).combined(with: .opacity),
+                    removal: .opacity
+                ))
+            }
+        }
+    }
+
+    // Subline for the chain header — always location-count first, so
+    // the AM can tell at a glance how many physical stores roll up
+    // under this chain even when collapsed. The per-location detail
+    // (storeNumber, per-store subtotal) lives in the location
+    // sub-header below, which is always visible when the chain is
+    // expanded.
+    private func chainSubline(_ chain: ChainGroup) -> String {
+        "\(chain.locationCount) store\(chain.locationCount == 1 ? "" : "s") · \(chain.boxCount) box\(chain.boxCount == 1 ? "" : "es") · \(chain.lineCount) line\(chain.lineCount == 1 ? "" : "s")"
+    }
+
+    // Per-location block within an expanded chain. Each store gets
+    // its own collapsible "#XXX · N boxes · $Y" sub-header, regardless
+    // of whether the chain has one or many locations.
+    //
+    // Visual treatment establishes three clearly-distinct tiers:
+    //   chain header        → accent-tinted band, headline font
+    //   location sub-header → grey grouped-background band, uppercase
+    //                         tracked typography (iOS section-header
+    //                         idiom), wide separator lines, leading
+    //                         indent
+    //   item rows           → white systemBackground, indented further
+    //                         so they visually "nest" under the
+    //                         location header
+    //
+    // The two earlier passes (no tint, then accent.opacity(0.06))
+    // didn't read as a section header — items below blended into the
+    // header's own row. The grouped-background grey + uppercase text
+    // is the same treatment iOS uses for plain List section headers,
+    // which is what AMs already pattern-match against on this kind of
+    // grouped data.
+    private func locationBlock(location: LocationGroup, chainName: String) -> some View {
+        let expanded = isExpanded(location)
+        return VStack(spacing: 0) {
+            Button {
+                toggleExpansion(location)
+            } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    // Smaller chevron than the chain header's, slight
+                    // leading indent so the location row reads as
+                    // nested under the chain rather than peer-level.
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    Text("STORE #\(location.storeNumber)")
+                        .font(.footnote.weight(.bold))
+                        .foregroundStyle(.primary)
+                        .tracking(0.5)
+                    Text("· \(location.boxCount) box\(location.boxCount == 1 ? "" : "es") · \(location.lineCount) line\(location.lineCount == 1 ? "" : "s")")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .textCase(.uppercase)
+                        .tracking(0.4)
+                    Spacer()
+                    Text(currency(location.subtotal))
+                        .font(.footnote.weight(.bold))
+                        .foregroundStyle(Color.accentColor)
+                        .monospacedDigit()
+                }
+                .padding(.leading, 32)        // indent vs chain header (20)
+                .padding(.trailing, 20)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+                .background(Color(.systemGroupedBackground))
+                .overlay(alignment: .top) {
+                    Rectangle().fill(Color(.separator)).frame(height: 0.5)
+                }
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(Color(.separator)).frame(height: 0.5)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Store #\(location.storeNumber), \(location.boxCount) box\(location.boxCount == 1 ? "" : "es"), \(currency(location.subtotal))")
+            .accessibilityHint(expanded ? "Tap to collapse" : "Tap to expand")
+            .accessibilityAddTraits(.isButton)
+
+            if expanded {
+                VStack(spacing: 0) {
+                    ForEach(Array(location.buckets.enumerated()), id: \.element.id) { idx, bucket in
+                        if idx > 0 {
+                            Divider()
+                        }
+                        boxBucketView(bucket: bucket, storeNumber: location.storeNumber)
+                    }
+                }
+                // Indent items 12pt further than the chain header so
+                // they visually "belong" to the location row above.
+                // Combined with the items' own 20pt internal padding,
+                // content sits at 32pt from the screen edge — same
+                // leading edge as the location-header text.
+                .padding(.leading, 12)
+                // Items live on plain background — the contrast with
+                // the grey location-header band above is what carries
+                // the "header vs content" distinction.
+                .background(Color(.systemBackground))
+                .transition(.asymmetric(
+                    insertion: .move(edge: .top).combined(with: .opacity),
+                    removal: .opacity
+                ))
+            }
+        }
+    }
+
+    // Effective location expansion. Filter override matches the
+    // chain-level rule — once filters narrow the view, hiding hits
+    // behind a second tap defeats the purpose.
+    private func isExpanded(_ location: LocationGroup) -> Bool {
+        if isFiltered { return true }
+        return expandedLocations.contains(location.storeNumber)
+    }
+
+    private func toggleExpansion(_ location: LocationGroup) {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            if expandedLocations.contains(location.storeNumber) {
+                expandedLocations.remove(location.storeNumber)
+            } else {
+                expandedLocations.insert(location.storeNumber)
+            }
+        }
+    }
+
+    // Effective expansion state. When any filter is active we treat
+    // every visible chain as expanded — see expandedChains comment.
+    private func isExpanded(_ chain: ChainGroup) -> Bool {
+        if isFiltered { return true }
+        return expandedChains.contains(chain.chainName)
+    }
+
+    private func toggleExpansion(_ chain: ChainGroup) {
+        // Animate the open/close so the body content slides in
+        // rather than popping. Cheap on a few chains; if a future area
+        // gets unwieldy we can drop the animation and rely on the
+        // chevron rotation alone.
+        withAnimation(.easeInOut(duration: 0.2)) {
+            if expandedChains.contains(chain.chainName) {
+                expandedChains.remove(chain.chainName)
+            } else {
+                expandedChains.insert(chain.chainName)
+            }
+        }
+    }
+
+    private func boxBucketView(bucket: BoxBucket, storeNumber: String) -> some View {
+        VStack(spacing: 0) {
+            // Box mini-header.
+            HStack(spacing: 6) {
+                Text(bucket.box.map { "Box \($0)" } ?? "Unboxed")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 8).padding(.vertical, 2)
+                    .background(Color.accentColor.opacity(0.14))
+                    .clipShape(Capsule())
+                Text("\(bucket.items.count) line\(bucket.items.count == 1 ? "" : "s")")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+
+            VStack(spacing: 0) {
+                ForEach(Array(bucket.items.enumerated()), id: \.offset) { idx, item in
+                    if idx > 0 {
+                        Divider().padding(.leading, 20)
+                    }
+                    itemRow(
+                        item: item,
+                        box: bucket.box,
+                        recordId: bucket.recordId,
+                        storeName: bucket.storeName,
+                        storeNumber: storeNumber
+                    )
+                }
+            }
+            .padding(.bottom, 4)
+        }
+    }
+
+    private func itemRow(
+        item: CloudSyncItem,
+        box: Int?,
+        recordId: String,
+        storeName: String,
+        storeNumber: String
+    ) -> some View {
+        // Read-only row. No bookmark column — the area view is for
+        // browsing across stores; flagging happens on the per-store
+        // screen where the AM is scoped to the location they're acting
+        // on. (See user request to remove "scan or add" affordances.)
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(item.name)
+                        .font(.subheadline).fontWeight(.semibold)
+                        .lineLimit(2)
+                    Spacer(minLength: 4)
+                    Text(item.upc)
+                        .monospaced()
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    if item.quantity > 1 {
+                        Text("× \(item.quantity)")
+                            .font(.caption).fontWeight(.semibold)
+                            .monospacedDigit()
+                            .foregroundStyle(Color.accentColor)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.accentColor.opacity(0.14))
+                            .clipShape(Capsule())
+                    }
+                }
+                HStack(spacing: 6) {
+                    if let commodity = item.commodity, !commodity.isEmpty {
+                        Text(commodity)
+                            .font(.caption2).fontWeight(.medium)
+                            .foregroundStyle(Color.accentColor)
+                            .padding(.horizontal, 6).padding(.vertical, 1)
+                            .background(Color.accentColor.opacity(0.12))
+                            .clipShape(Capsule())
+                            .lineLimit(1)
+                    }
+                    if let rank = item.rank {
+                        Text("Rank \(rank)")
+                            .font(.caption2).fontWeight(.medium)
+                            .foregroundStyle(rankColor(rank))
+                            .padding(.horizontal, 6).padding(.vertical, 1)
+                            .background(rankColor(rank).opacity(0.12))
+                            .clipShape(Capsule())
+                    }
+                    Spacer()
+                    Text(currency(item.price * Double(item.quantity)))
+                        .font(.subheadline).fontWeight(.semibold)
+                        .foregroundStyle(Color.accentColor)
+                        .monospacedDigit()
+                    if let retail = item.retailPrice {
+                        Text("(retail \(currency(retail)))")
+                            .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+    }
+
+    private func rankColor(_ rank: Int) -> Color {
+        switch rank {
+        case ..<21:   return .green
+        case 21..<51: return .accentColor
+        default:      return .orange
+        }
+    }
+
+    private var totals: some View {
+        VStack(spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Area total")
+                    .font(.title3).fontWeight(.semibold)
+                Spacer()
+                Text(currency(grandTotal))
+                    .font(.title3).fontWeight(.bold)
+                    .foregroundStyle(Color.accentColor)
+                    .monospacedDigit()
+            }
+            if grandRetail > 0 {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Total retail")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(currency(grandRetail))
+                        .font(.subheadline).fontWeight(.medium)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 18)
+        .frame(maxWidth: .infinity)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color.accentColor.opacity(0.04),
+                    Color.accentColor.opacity(0.14)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.accentColor.opacity(0.55))
+                .frame(height: 2)
+        }
+        .padding(.top, 12)
+    }
+
+    private func currency(_ value: Double) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .currency
+        f.locale = Locale(identifier: "en_US")
+        return f.string(from: NSNumber(value: value)) ?? "$\(value)"
+    }
+}
+
+// Tiny String helper used by AreaBackstockView's label resolution.
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
 // Notification fired by TeamSessionDetailView whenever an edit
 // (quantity, delete, box-number) changes the record. StoreHistoryList
 // listens and reloads so its summary (date / subtotal / Box chip)
@@ -7082,13 +8361,81 @@ struct PickListSheet: View {
     @State private var errorMessage: String?
     @State private var showError: Bool = false
 
+    // Search + commodity filter state. Mirrors AllBackstockDetailView
+    // so AMs walking the floor with the pick list open get the same
+    // narrowing controls they already know from the parent screen.
+    @State private var searchText: String = ""
+    @State private var selectedCommodity: String?
+
+    private var trimmedSearch: String {
+        searchText.trimmingCharacters(in: .whitespaces)
+    }
+
+    // Distinct commodities present on currently-flagged items, for
+    // the dropdown's option list. Empty/nil are dropped — the "All
+    // commodities" default covers them.
+    private var availableCommodities: [String] {
+        let raw = store.items.compactMap { $0.commodity }
+            .filter { !$0.isEmpty }
+        return Array(Set(raw)).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    // Single-pass filter applied before grouping. Same UPC-zero-strip
+    // normalization as AllBackstockDetailView so a 13-digit barcode
+    // scan still matches a 12-digit catalog entry.
+    private var filteredItems: [PickListItem] {
+        var items = store.items
+        if let selectedCommodity, !selectedCommodity.isEmpty {
+            items = items.filter { ($0.commodity ?? "") == selectedCommodity }
+        }
+        let q = trimmedSearch.lowercased()
+        if !q.isEmpty {
+            let qUPC = Self.stripLeadingZeros(q)
+            items = items.filter { item in
+                let itemUPC = Self.stripLeadingZeros(item.upc.lowercased())
+                let name = item.name.lowercased()
+                return itemUPC.contains(qUPC) || name.contains(q)
+            }
+        }
+        return items
+    }
+
+    private static func stripLeadingZeros(_ s: String) -> String {
+        guard !s.isEmpty, s.allSatisfy({ $0.isNumber }) else { return s }
+        let stripped = String(s.drop(while: { $0 == "0" }))
+        return stripped.isEmpty ? s : stripped
+    }
+
+    private var isFiltered: Bool {
+        !trimmedSearch.isEmpty || selectedCommodity != nil
+    }
+
+    private var visiblePendingCount: Int {
+        filteredItems.reduce(0) { $0 + ($1.picked ? 0 : 1) }
+    }
+
+    private var visiblePickedCount: Int {
+        filteredItems.reduce(0) { $0 + ($1.picked ? 1 : 0) }
+    }
+
+    @ViewBuilder
+    private var tallyText: some View {
+        if isFiltered {
+            Text("\(visiblePendingCount) to pull (of \(store.pendingCount))")
+                .font(.subheadline).fontWeight(.semibold)
+        } else {
+            Text("\(visiblePendingCount) to pull")
+                .font(.subheadline).fontWeight(.semibold)
+        }
+    }
+
     // Group by box for readability — when an AM is walking from box
     // to box they'd rather see the items grouped than scattered.
     // Within a group we preserve insertion order (chronological flag
     // order) so the most-recently-flagged items sort to the bottom
     // of their box's section.
     private var grouped: [(boxLabel: String, items: [PickListItem])] {
-        let buckets = Dictionary(grouping: store.items) { item in
+        let buckets = Dictionary(grouping: filteredItems) { item in
             item.box.map { "Box \($0)" } ?? "Unboxed"
         }
         return buckets
@@ -7120,17 +8467,42 @@ struct PickListSheet: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
+                    VStack(spacing: 0) {
+                        commodityFilterChip
+                        if grouped.isEmpty {
+                            // Items exist but filters narrowed everything
+                            // out — give the AM an easy escape hatch
+                            // rather than a blank screen.
+                            VStack(spacing: 8) {
+                                Image(systemName: "line.3.horizontal.decrease.circle")
+                                    .font(.system(size: 40))
+                                    .foregroundStyle(.secondary)
+                                Text("No matches")
+                                    .font(.headline)
+                                Button("Clear filters") {
+                                    searchText = ""
+                                    selectedCommodity = nil
+                                }
+                                .font(.subheadline)
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        } else {
                     List {
                         // Tally line at the top — pending count is what
                         // the AM cares about while walking; total is for
                         // context.
                         Section {
                             HStack {
-                                Text("\(store.pendingCount) to pull")
-                                    .font(.subheadline).fontWeight(.semibold)
+                                // Tally reflects the visible (filtered)
+                                // slice — when a filter is on, the AM
+                                // is walking against that subset, not
+                                // the full pick list. The "of N" suffix
+                                // reminds them they're looking at a
+                                // narrowed view.
+                                tallyText
                                 Spacer()
-                                if store.pickedCount > 0 {
-                                    Text("\(store.pickedCount) picked")
+                                if visiblePickedCount > 0 {
+                                    Text("\(visiblePickedCount) picked")
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
                             }
@@ -7153,8 +8525,13 @@ struct PickListSheet: View {
                         }
                     }
                     .listStyle(.insetGrouped)
+                        }
+                    }
                 }
             }
+            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search by UPC or name")
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
             .navigationTitle("Pick list")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -7337,6 +8714,76 @@ struct PickListSheet: View {
             // Clean run — close the sheet so the AM lands back on the
             // (now-fresh) line items list.
             dismiss()
+        }
+    }
+
+    // Commodity dropdown chip — sits between the .searchable bar and
+    // the grouped list. Hidden when no flagged item carries a
+    // commodity, so a list of pure-manual entries doesn't show a
+    // useless dropdown. Mirrors AllBackstockDetailView.commodityFilterChip
+    // visually so the AM gets the same control on both surfaces.
+    @ViewBuilder
+    private var commodityFilterChip: some View {
+        let commodities = availableCommodities
+        if !commodities.isEmpty {
+            HStack(spacing: 8) {
+                Menu {
+                    Button {
+                        selectedCommodity = nil
+                    } label: {
+                        if selectedCommodity == nil {
+                            Label("All commodities", systemImage: "checkmark")
+                        } else {
+                            Text("All commodities")
+                        }
+                    }
+                    Divider()
+                    ForEach(commodities, id: \.self) { commodity in
+                        Button {
+                            selectedCommodity = commodity
+                        } label: {
+                            if selectedCommodity == commodity {
+                                Label(commodity, systemImage: "checkmark")
+                            } else {
+                                Text(commodity)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "tag")
+                            .font(.caption)
+                        Text(selectedCommodity ?? "All commodities")
+                            .font(.caption.weight(.medium))
+                            .lineLimit(1)
+                        Image(systemName: "chevron.down")
+                            .font(.caption2)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(
+                        selectedCommodity != nil
+                        ? Color.accentColor.opacity(0.20)
+                        : Color.accentColor.opacity(0.08)
+                    )
+                    .foregroundStyle(Color.accentColor)
+                    .clipShape(Capsule())
+                }
+                if selectedCommodity != nil {
+                    Button {
+                        selectedCommodity = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                            .font(.subheadline)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear commodity filter")
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
         }
     }
 
@@ -7706,6 +9153,11 @@ struct SessionDetailView: View {
         case .scanOrder:  return filtered
         case .nameAZ:     return filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         case .nameZA:     return filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedDescending }
+        case .quantityDesc:
+            return filtered.sorted { a, b in
+                if a.quantity != b.quantity { return a.quantity > b.quantity }
+                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            }
         }
     }
 
